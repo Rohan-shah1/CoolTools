@@ -445,6 +445,9 @@ class SpotifyMonitor:
         )
         self.log("=" * 50)
 
+        # Ensure Spotify is unmuted when monitor starts
+        self.unmute_spotify()
+
         while self.running:
             try:
                 self._tick()
@@ -614,6 +617,8 @@ class SpotifyMonitor:
 
     def stop(self):
         self.running = False
+        # Ensure Spotify is unmuted when monitor stops
+        self.unmute_spotify()
 
 
 # ==========================================================
