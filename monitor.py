@@ -19,6 +19,7 @@ import comtypes.client
 import psutil
 import win32gui
 import win32process
+import win32con
 
 # Audio muting and volume metering
 from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume, IAudioMeterInformation
@@ -249,32 +250,21 @@ class SpotifyMonitor:
                 return None, None
             hwnd, _ = window
             root = _uia_client.ElementFromHandle(hwnd)
-            condition = _uia_client.CreateTrueCondition()
 
-            lyrics_elem = None
-            volume_elem = None
+            # Create property conditions for Lyrics button
+            cond_lyrics_name = _uia_client.CreatePropertyCondition(_UIA.UIA_NamePropertyId, "Lyrics")
+            cond_lyrics_type = _uia_client.CreatePropertyCondition(_UIA.UIA_ControlTypePropertyId, 50000) # Button
+            cond_lyrics = _uia_client.CreateAndCondition(cond_lyrics_name, cond_lyrics_type)
 
-            def _search(elem):
-                nonlocal lyrics_elem, volume_elem
-                if lyrics_elem and volume_elem:
-                    return
-                try:
-                    name = elem.CurrentName or ""
-                    ctype = elem.CurrentControlType
-                    if name == "Lyrics" and ctype == 50000:   # Button
-                        lyrics_elem = elem
-                    elif name == "Change volume" and ctype == 50015:  # Slider
-                        volume_elem = elem
-                except Exception:
-                    return
-                try:
-                    children = elem.FindAll(_UIA.TreeScope_Children, condition)
-                    for i in range(children.Length):
-                        _search(children.GetElement(i))
-                except Exception:
-                    pass
+            # Create property conditions for Volume slider
+            cond_volume_name = _uia_client.CreatePropertyCondition(_UIA.UIA_NamePropertyId, "Change volume")
+            cond_volume_type = _uia_client.CreatePropertyCondition(_UIA.UIA_ControlTypePropertyId, 50015) # Slider
+            cond_volume = _uia_client.CreateAndCondition(cond_volume_name, cond_volume_type)
 
-            _search(root)
+            # Find elements natively in UIA (very fast)
+            lyrics_elem = root.FindFirst(_UIA.TreeScope_Descendants, cond_lyrics)
+            volume_elem = root.FindFirst(_UIA.TreeScope_Descendants, cond_volume)
+
             return lyrics_elem, volume_elem
         except Exception as e:
             self.log(f"[WARN] UIA search error: {e}")
@@ -290,16 +280,20 @@ class SpotifyMonitor:
             if lyrics_elem:
                 tog_pat = lyrics_elem.GetCurrentPattern(_UIA.UIA_TogglePatternId)
                 toggle_client = tog_pat.QueryInterface(_UIA.IUIAutomationTogglePattern)
-                self._saved_lyrics_on = (toggle_client.CurrentToggleState == 1)
-                self.log(f"[STATE] Lyrics is {'ON' if self._saved_lyrics_on else 'OFF'}")
+                lyrics_on = (toggle_client.CurrentToggleState == 1)
+                if self._saved_lyrics_on is None or lyrics_on != self._saved_lyrics_on:
+                    self._saved_lyrics_on = lyrics_on
+                    self.log(f"[STATE] Lyrics is {'ON' if self._saved_lyrics_on else 'OFF'}")
 
             if volume_elem:
                 range_pat = volume_elem.GetCurrentPattern(_UIA.UIA_RangeValuePatternId)
                 range_client = range_pat.QueryInterface(_UIA.IUIAutomationRangeValuePattern)
-                self._saved_volume = range_client.CurrentValue
-                self.log(f"[STATE] Volume captured: {self._saved_volume:.2f}")
-        except Exception as e:
-            self.log(f"[WARN] State capture error: {e}")
+                vol = range_client.CurrentValue
+                if self._saved_volume is None or abs(vol - self._saved_volume) > 0.01:
+                    self._saved_volume = vol
+                    self.log(f"[STATE] Volume captured: {self._saved_volume:.2f}")
+        except Exception:
+            pass
 
     def restore_spotify_ui_state(self):
         """Restore lyrics toggle state and volume level after Spotify restarts."""
@@ -310,24 +304,43 @@ class SpotifyMonitor:
         try:
             lyrics_elem, volume_elem = self._find_uia_player_controls()
 
-            # Restore volume via mouse click on the slider
+            # Restore volume via SetValue (native) or click
             if volume_elem and self._saved_volume is not None:
                 try:
                     range_pat = volume_elem.GetCurrentPattern(_UIA.UIA_RangeValuePatternId)
                     range_client = range_pat.QueryInterface(_UIA.IUIAutomationRangeValuePattern)
                     current_vol = range_client.CurrentValue
                     if abs(current_vol - self._saved_volume) > 0.01:
-                        # Click the slider at the saved proportion
-                        rect = volume_elem.CurrentBoundingRectangle
-                        target_x = int(rect.left + (rect.right - rect.left) * self._saved_volume)
-                        target_y = int((rect.top + rect.bottom) / 2)
-                        ctypes.windll.user32.SetCursorPos(target_x, target_y)
-                        time.sleep(0.05)
-                        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-                        time.sleep(0.05)
-                        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-                        time.sleep(0.2)
-                        self.log(f"[RESTORE] Volume set to {self._saved_volume:.2f}")
+                        try:
+                            # Try direct UIA SetValue
+                            range_client.SetValue(self._saved_volume)
+                            time.sleep(0.1)
+                            if abs(range_client.CurrentValue - self._saved_volume) <= 0.02:
+                                self.log(f"[RESTORE] Volume set to {self._saved_volume:.2f} via UIA SetValue")
+                                volume_elem = None  # mark done
+                        except Exception as e:
+                            self.log(f"[RESTORE] SetValue failed: {e}. Falling back to click.")
+
+                        if volume_elem is not None:
+                            # Click the slider at the saved proportion
+                            rect = volume_elem.CurrentBoundingRectangle
+                            target_x = int(rect.left + (rect.right - rect.left) * self._saved_volume)
+                            target_y = int((rect.top + rect.bottom) / 2)
+                            
+                            # Bring window to foreground to ensure click registers
+                            hwnd, _ = self.find_spotify_window()
+                            if hwnd:
+                                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                                win32gui.SetForegroundWindow(hwnd)
+                                time.sleep(0.1)
+                                
+                            ctypes.windll.user32.SetCursorPos(target_x, target_y)
+                            time.sleep(0.05)
+                            ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+                            time.sleep(0.05)
+                            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+                            time.sleep(0.2)
+                            self.log(f"[RESTORE] Volume set to {self._saved_volume:.2f} via mouse click")
                     else:
                         self.log(f"[RESTORE] Volume unchanged at {current_vol:.2f}")
                 except Exception as e:
@@ -340,17 +353,34 @@ class SpotifyMonitor:
                     toggle_client = tog_pat.QueryInterface(_UIA.IUIAutomationTogglePattern)
                     current_lyrics_on = (toggle_client.CurrentToggleState == 1)
                     if current_lyrics_on != self._saved_lyrics_on:
-                        # Click the lyrics button to toggle it
-                        rect = lyrics_elem.CurrentBoundingRectangle
-                        cx = int((rect.left + rect.right) / 2)
-                        cy = int((rect.top + rect.bottom) / 2)
-                        ctypes.windll.user32.SetCursorPos(cx, cy)
-                        time.sleep(0.05)
-                        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-                        time.sleep(0.05)
-                        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-                        time.sleep(0.2)
-                        self.log(f"[RESTORE] Lyrics toggled to {'ON' if self._saved_lyrics_on else 'OFF'}")
+                        try:
+                            toggle_client.Toggle()
+                            time.sleep(0.1)
+                            if (toggle_client.CurrentToggleState == 1) == self._saved_lyrics_on:
+                                self.log(f"[RESTORE] Lyrics toggled to {'ON' if self._saved_lyrics_on else 'OFF'} via UIA Toggle")
+                                lyrics_elem = None  # mark done
+                        except Exception as e:
+                            self.log(f"[RESTORE] UIA Toggle failed: {e}. Falling back to click.")
+
+                        if lyrics_elem is not None:
+                            # Click the lyrics button to toggle it
+                            rect = lyrics_elem.CurrentBoundingRectangle
+                            cx = int((rect.left + rect.right) / 2)
+                            cy = int((rect.top + rect.bottom) / 2)
+                            
+                            hwnd, _ = self.find_spotify_window()
+                            if hwnd:
+                                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                                win32gui.SetForegroundWindow(hwnd)
+                                time.sleep(0.1)
+
+                            ctypes.windll.user32.SetCursorPos(cx, cy)
+                            time.sleep(0.05)
+                            ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+                            time.sleep(0.05)
+                            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+                            time.sleep(0.2)
+                            self.log(f"[RESTORE] Lyrics toggled to {'ON' if self._saved_lyrics_on else 'OFF'} via mouse click")
                     else:
                         self.log(f"[RESTORE] Lyrics already {'ON' if current_lyrics_on else 'OFF'}, no change needed")
                 except Exception as e:
@@ -499,6 +529,7 @@ class SpotifyMonitor:
             self.state = self.MUSIC_PLAYING
             self.last_song_title = title
             self.status_message = f"Playing: {title}"
+            self.capture_spotify_ui_state()
             return
 
         # -- Ad detected -----------------------------------
@@ -507,14 +538,10 @@ class SpotifyMonitor:
             self.log(f'[AD] >>> AD DETECTED <<<  Title: "{title}"')
             self.log(f'     Last song: "{self.last_song_title}"')
 
-            # 1. Capture current UI state (volume + lyrics) before killing
-            self.log("[STATE] Capturing UI state before restart...")
-            self.capture_spotify_ui_state()
-
-            # 2. Instant mute
+            # 1. Instant mute
             self.mute_spotify()
 
-            # 3. Kill immediately (no delay — state is already saved)
+            # 2. Kill immediately (no delay — state is already saved)
             self.kill_spotify()
             self.state = self.RESTARTING
 
