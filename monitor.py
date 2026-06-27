@@ -523,8 +523,8 @@ class SpotifyMonitor:
             # 5. Relaunch
             self.launch_spotify()
 
-            # 6. Poll for Spotify window (faster than a fixed sleep)
-            self.log("[WAIT] Waiting for Spotify to load...")
+            # 6. Wait for Spotify window to appear
+            self.log("[WAIT] Waiting for Spotify window...")
             load_deadline = time.time() + LOAD_WAIT_TIME
             loaded = False
             while time.time() < load_deadline:
@@ -534,26 +534,65 @@ class SpotifyMonitor:
                     break
             if not loaded:
                 self.log("[WARN] Spotify window not detected within load window")
-            else:
-                # Give the UI an extra moment to be interactive
+
+            # 7. Wait for the player UI to be fully ready
+            #    (poll for UIA controls — the window shell appears fast but
+            #     the internal web player takes longer to load)
+            self.log("[WAIT] Waiting for player UI to be ready...")
+            ui_ready = False
+            ui_deadline = time.time() + 15  # max 15s total for UI
+            while time.time() < ui_deadline:
+                time.sleep(1.0)
+                lyrics_elem, volume_elem = self._find_uia_player_controls()
+                if lyrics_elem or volume_elem:
+                    ui_ready = True
+                    self.log("[OK] Player UI controls detected — Spotify is ready")
+                    break
+            if not ui_ready:
+                self.log("[WARN] Player controls not found — continuing anyway")
+                time.sleep(3)  # fallback fixed wait
+
+            # 8. Resume playback — use audio peak to confirm it's actually playing
+            for attempt in range(4):
+                self.send_play_key()
+                self.log(f"[PLAY] Play key sent (attempt {attempt + 1})")
                 time.sleep(1.5)
+                peak = self.get_spotify_peak_volume()
+                if peak > 0.001:
+                    self.log(f"[PLAY] Playback confirmed (audio peak: {peak:.4f})")
+                    break
+                self.log(f"[PLAY] No audio yet (peak: {peak:.4f}), retrying...")
 
-            # 7. Resume playback
-            self.send_play_key()
-            self.log("[PLAY] Play key sent")
-
-            # 8. Unmute the new instance
-            time.sleep(1)
+            # 9. Unmute the new instance
+            time.sleep(0.5)
             self.unmute_spotify()
 
-            # 9. Restore saved UI state (volume + lyrics)
+            # 10. Restore saved UI state (volume + lyrics) with retries
             self.log("[RESTORE] Restoring UI state...")
-            self.restore_spotify_ui_state()
+            for restore_attempt in range(3):
+                self.restore_spotify_ui_state()
+                # Verify volume was restored
+                if self._saved_volume is not None:
+                    _, vol_elem = self._find_uia_player_controls()
+                    if vol_elem:
+                        try:
+                            range_pat = vol_elem.GetCurrentPattern(_UIA.UIA_RangeValuePatternId)
+                            range_client = range_pat.QueryInterface(_UIA.IUIAutomationRangeValuePattern)
+                            current_vol = range_client.CurrentValue
+                            if abs(current_vol - self._saved_volume) <= 0.05:
+                                self.log(f"[RESTORE] Volume verified at {current_vol:.2f}")
+                                break
+                            else:
+                                self.log(f"[RESTORE] Volume mismatch ({current_vol:.2f} vs {self._saved_volume:.2f}), retrying...")
+                        except Exception:
+                            pass
+                else:
+                    break
+                time.sleep(1)
 
-            # 10. Check if same song loaded — skip immediately if so
+            # 11. Check if same song loaded — skip immediately if so
             self.log("[CHECK] Verifying song after restart...")
-            skipped = False
-            for _ in range(5):  # Up to 5 attempts, 1s apart
+            for _ in range(5):
                 time.sleep(1.0)
                 new_window = self.find_spotify_window()
                 if new_window:
@@ -562,10 +601,9 @@ class SpotifyMonitor:
                         if new_title == self.last_song_title:
                             self.log(f"[SKIP] Same song detected ('{new_title}') — skipping immediately")
                             self.send_next_key()
-                            skipped = True
-                        break  # Song detected (different or same+skipped) — done
+                        break
 
-            # 11. Enter cooldown
+            # 12. Enter cooldown
             self.ads_skipped += 1
             self.last_restart_time = time.time()
             self.state = self.COOLDOWN
