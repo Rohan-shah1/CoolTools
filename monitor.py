@@ -20,6 +20,7 @@ import psutil
 import win32gui
 import win32process
 import win32con
+import win32api
 
 # Audio muting and volume metering
 from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume, IAudioMeterInformation
@@ -58,6 +59,10 @@ AD_TITLE_CONTAINS_LOWER = {t.strip().lower() for t in AD_TITLE_CONTAINS if t.str
 # For these, we will verify if audio is actually playing before treating them as ads.
 AMBIGUOUS_TITLES = {"spotify", "spotify free", "spotify premium", "join premium"}
 
+# Chromium flag required for reliable accessibility tree exposure.
+# Without this, the Lyrics button's ToggleState can be stale or missing.
+_FORCE_A11Y_FLAG = "--force-renderer-accessibility"
+
 
 
 # ==========================================================
@@ -86,6 +91,23 @@ class SpotifyMonitor:
         # Saved pre-restart state
         self._saved_volume = None        # float 0.0–1.0
         self._saved_lyrics_on = None     # bool
+        # Window placement saved before kill, for restoring window state after relaunch
+        self._saved_window_placement = None
+        
+        # Track whether Spotify is active to perform event-driven UI state captures
+        self._spotify_was_active = False
+        
+        # Shutdown event for responsive thread termination
+        self.shutdown_event = threading.Event()
+
+    # -- Sleep utility -------------------------------------
+
+    def _sleep(self, seconds: float) -> bool:
+        """Sleep for the specified seconds, but return early if shutdown is requested.
+        
+        Returns True if shutdown was requested, False otherwise.
+        """
+        return self.shutdown_event.wait(seconds)
 
     # -- Spotify path detection ----------------------------
 
@@ -240,15 +262,28 @@ class SpotifyMonitor:
 
     # -- UI Automation helpers (lyrics + volume state) ------
 
-    def _find_uia_player_controls(self):
-        """Return (lyrics_elem, volume_elem) from Spotify's UIA tree, or (None, None)."""
+    def _find_uia_player_controls(self, verbose=False):
+        """Return (lyrics_elem, volume_elem) from Spotify's UIA tree, or (None, None).
+
+        Always obtains a fresh element from the current live HWND to avoid
+        stale COM proxy references after a Spotify restart.
+        """
         if not UIA_AVAILABLE:
+            if verbose:
+                self.log("[LYRICS-DETECT] UIA not available — skipping control search")
             return None, None
         try:
             window = self.find_spotify_window()
             if not window:
+                if verbose:
+                    self.log("[LYRICS-DETECT] No Spotify window found for UIA search")
                 return None, None
-            hwnd, _ = window
+            hwnd, title = window
+
+            # Always obtain a fresh UIA root element from the live HWND.
+            # This prevents stale COM proxy issues after Spotify restarts
+            # (Windows may reuse HWNDs but the COM element from the old
+            # process points into a dead accessibility tree).
             root = _uia_client.ElementFromHandle(hwnd)
 
             # Create property conditions for Lyrics button
@@ -265,130 +300,202 @@ class SpotifyMonitor:
             lyrics_elem = root.FindFirst(_UIA.TreeScope_Descendants, cond_lyrics)
             volume_elem = root.FindFirst(_UIA.TreeScope_Descendants, cond_volume)
 
+            if verbose:
+                self.log(
+                    f"[LYRICS-DETECT] UIA search on HWND {hwnd} ('{title}'): "
+                    f"lyrics={'FOUND' if lyrics_elem else 'NOT FOUND'}, "
+                    f"volume={'FOUND' if volume_elem else 'NOT FOUND'}"
+                )
+
             return lyrics_elem, volume_elem
         except Exception as e:
             self.log(f"[WARN] UIA search error: {e}")
             return None, None
 
+    def _read_lyrics_state_reliable(self, lyrics_elem, verbose=False):
+        """Read the Lyrics toggle state reliably by double-reading with a delay.
+
+        Returns True (ON), False (OFF), or None if the state could not be
+        determined reliably (e.g. the two reads disagree, indicating a
+        transient/stale value).
+        """
+        if not lyrics_elem:
+            return None
+        try:
+            # First read
+            tog_pat = lyrics_elem.GetCurrentPattern(_UIA.UIA_TogglePatternId)
+            toggle_client = tog_pat.QueryInterface(_UIA.IUIAutomationTogglePattern)
+            state1 = toggle_client.CurrentToggleState
+
+            # Wait briefly and re-read to confirm stability
+            if self._sleep(0.2):
+                return None
+
+            # Second read — obtain a fresh pattern reference to avoid cached values
+            tog_pat2 = lyrics_elem.GetCurrentPattern(_UIA.UIA_TogglePatternId)
+            toggle_client2 = tog_pat2.QueryInterface(_UIA.IUIAutomationTogglePattern)
+            state2 = toggle_client2.CurrentToggleState
+
+            if state1 == state2:
+                lyrics_on = (state1 == 1)
+                if verbose:
+                    self.log(f"[LYRICS-DETECT] Double-read confirmed: state={state1} -> {'ON' if lyrics_on else 'OFF'}")
+                return lyrics_on
+            else:
+                self.log(f"[LYRICS-DETECT] Double-read MISMATCH: state1={state1}, state2={state2} — treating as unreliable")
+                return None
+        except Exception as e:
+            self.log(f"[LYRICS-DETECT] Error reading toggle state: {e}")
+            return None
+
     def capture_spotify_ui_state(self):
-        """Save current lyrics toggle state and volume level before restart."""
+        """Save current lyrics toggle state and volume level before restart.
+
+        Uses a retry loop with back-off to handle the case where Spotify's
+        internal web player has not yet built its accessibility tree. The
+        Lyrics button and Volume slider typically appear 3–12 seconds after
+        the native window becomes visible.
+        """
         if not UIA_AVAILABLE:
             return
-        try:
-            lyrics_elem, volume_elem = self._find_uia_player_controls()
 
-            if lyrics_elem:
-                tog_pat = lyrics_elem.GetCurrentPattern(_UIA.UIA_TogglePatternId)
-                toggle_client = tog_pat.QueryInterface(_UIA.IUIAutomationTogglePattern)
-                lyrics_on = (toggle_client.CurrentToggleState == 1)
-                if self._saved_lyrics_on is None or lyrics_on != self._saved_lyrics_on:
-                    self._saved_lyrics_on = lyrics_on
-                    self.log(f"[STATE] Lyrics is {'ON' if self._saved_lyrics_on else 'OFF'}")
+        max_attempts = 3
+        retry_delay = 0.5  # seconds between retries during normal polling
 
-            if volume_elem:
-                range_pat = volume_elem.GetCurrentPattern(_UIA.UIA_RangeValuePatternId)
-                range_client = range_pat.QueryInterface(_UIA.IUIAutomationRangeValuePattern)
-                vol = range_client.CurrentValue
-                if self._saved_volume is None or abs(vol - self._saved_volume) > 0.01:
-                    self._saved_volume = vol
-                    self.log(f"[STATE] Volume captured: {self._saved_volume:.2f}")
-        except Exception:
-            pass
+        for attempt in range(1, max_attempts + 1):
+            try:
+                lyrics_elem, volume_elem = self._find_uia_player_controls()
+
+                captured_lyrics = False
+                captured_volume = False
+
+                if lyrics_elem:
+                    lyrics_on = self._read_lyrics_state_reliable(lyrics_elem)
+                    if lyrics_on is not None:
+                        if self._saved_lyrics_on is None or lyrics_on != self._saved_lyrics_on:
+                            self._saved_lyrics_on = lyrics_on
+                            self.log(f"[STATE] Lyrics is {'ON' if self._saved_lyrics_on else 'OFF'}")
+                        captured_lyrics = True
+
+                if volume_elem:
+                    try:
+                        range_pat = volume_elem.GetCurrentPattern(_UIA.UIA_RangeValuePatternId)
+                        range_client = range_pat.QueryInterface(_UIA.IUIAutomationRangeValuePattern)
+                        vol = range_client.CurrentValue
+                        if self._saved_volume is None or abs(vol - self._saved_volume) > 0.01:
+                            self._saved_volume = vol
+                            self.log(f"[STATE] Volume captured: {self._saved_volume:.2f}")
+                        captured_volume = True
+                    except Exception as e:
+                        self.log(f"[WARN] Volume capture error: {e}")
+
+                if captured_lyrics and captured_volume:
+                    return  # Both captured successfully
+
+                if attempt < max_attempts:
+                    self.log(
+                        f"[STATE] Capture attempt {attempt}/{max_attempts}: "
+                        f"lyrics={'OK' if captured_lyrics else 'MISSING'}, "
+                        f"volume={'OK' if captured_volume else 'MISSING'} — retrying in {retry_delay}s"
+                    )
+                    if self._sleep(retry_delay):
+                        return
+
+            except Exception as e:
+                self.log(f"[WARN] UI state capture error (attempt {attempt}): {e}")
+                if attempt < max_attempts:
+                    if self._sleep(retry_delay):
+                        return
 
     def restore_spotify_ui_state(self):
-        """Restore lyrics toggle state and volume level after Spotify restarts."""
+        """Restore lyrics toggle state and volume level after Spotify restarts.
+
+        Uses UIA's native Toggle() and SetValue() patterns instead of mouse
+        simulation. This avoids sending WM_MOUSEACTIVATE which would steal
+        foreground focus from the user's active window.
+        """
         if not UIA_AVAILABLE:
             return
         if self._saved_volume is None and self._saved_lyrics_on is None:
+            self.log("[RESTORE] No saved state to restore")
             return
         try:
-            lyrics_elem, volume_elem = self._find_uia_player_controls()
+            lyrics_elem, volume_elem = self._find_uia_player_controls(verbose=True)
 
-            # Restore volume via SetValue (native) or click
+            # --- Restore volume via UIA SetValue (no mouse, no focus steal) ---
             if volume_elem and self._saved_volume is not None:
                 try:
                     range_pat = volume_elem.GetCurrentPattern(_UIA.UIA_RangeValuePatternId)
                     range_client = range_pat.QueryInterface(_UIA.IUIAutomationRangeValuePattern)
                     current_vol = range_client.CurrentValue
-                    if abs(current_vol - self._saved_volume) > 0.01:
-                        try:
-                            # Try direct UIA SetValue
-                            range_client.SetValue(self._saved_volume)
-                            time.sleep(0.1)
-                            if abs(range_client.CurrentValue - self._saved_volume) <= 0.02:
-                                self.log(f"[RESTORE] Volume set to {self._saved_volume:.2f} via UIA SetValue")
-                                volume_elem = None  # mark done
-                        except Exception as e:
-                            self.log(f"[RESTORE] SetValue failed: {e}. Falling back to click.")
-
-                        if volume_elem is not None:
-                            # Click the slider at the saved proportion
-                            rect = volume_elem.CurrentBoundingRectangle
-                            target_x = int(rect.left + (rect.right - rect.left) * self._saved_volume)
-                            target_y = int((rect.top + rect.bottom) / 2)
-                            
-                            # Bring window to foreground to ensure click registers
-                            hwnd, _ = self.find_spotify_window()
-                            if hwnd:
-                                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                                win32gui.SetForegroundWindow(hwnd)
-                                time.sleep(0.1)
-                                
-                            ctypes.windll.user32.SetCursorPos(target_x, target_y)
-                            time.sleep(0.05)
-                            ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-                            time.sleep(0.05)
-                            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-                            time.sleep(0.2)
-                            self.log(f"[RESTORE] Volume set to {self._saved_volume:.2f} via mouse click")
+                    if abs(current_vol - self._saved_volume) > 0.02:
+                        self.log(f"[RESTORE] Volume: current={current_vol:.2f}, target={self._saved_volume:.2f} — setting via UIA SetValue")
+                        range_client.SetValue(self._saved_volume)
+                        if self._sleep(0.15):
+                            return
+                        # Verify
+                        new_vol = range_client.CurrentValue
+                        self.log(f"[RESTORE] Volume after SetValue: {new_vol:.2f}")
                     else:
-                        self.log(f"[RESTORE] Volume unchanged at {current_vol:.2f}")
+                        self.log(f"[RESTORE] Volume already close to saved value ({current_vol:.2f} vs {self._saved_volume:.2f})")
                 except Exception as e:
                     self.log(f"[WARN] Volume restore error: {e}")
 
-            # Restore lyrics toggle state
+            # --- Restore lyrics via UIA Toggle() (no mouse, no focus steal) ---
             if lyrics_elem and self._saved_lyrics_on is not None:
                 try:
-                    tog_pat = lyrics_elem.GetCurrentPattern(_UIA.UIA_TogglePatternId)
-                    toggle_client = tog_pat.QueryInterface(_UIA.IUIAutomationTogglePattern)
-                    current_lyrics_on = (toggle_client.CurrentToggleState == 1)
-                    if current_lyrics_on != self._saved_lyrics_on:
-                        try:
-                            toggle_client.Toggle()
-                            time.sleep(0.1)
-                            if (toggle_client.CurrentToggleState == 1) == self._saved_lyrics_on:
-                                self.log(f"[RESTORE] Lyrics toggled to {'ON' if self._saved_lyrics_on else 'OFF'} via UIA Toggle")
-                                lyrics_elem = None  # mark done
-                        except Exception as e:
-                            self.log(f"[RESTORE] UIA Toggle failed: {e}. Falling back to click.")
-
-                        if lyrics_elem is not None:
-                            # Click the lyrics button to toggle it
-                            rect = lyrics_elem.CurrentBoundingRectangle
-                            cx = int((rect.left + rect.right) / 2)
-                            cy = int((rect.top + rect.bottom) / 2)
-                            
-                            hwnd, _ = self.find_spotify_window()
-                            if hwnd:
-                                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                                win32gui.SetForegroundWindow(hwnd)
-                                time.sleep(0.1)
-
-                            ctypes.windll.user32.SetCursorPos(cx, cy)
-                            time.sleep(0.05)
-                            ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-                            time.sleep(0.05)
-                            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-                            time.sleep(0.2)
-                            self.log(f"[RESTORE] Lyrics toggled to {'ON' if self._saved_lyrics_on else 'OFF'} via mouse click")
+                    current_lyrics = self._read_lyrics_state_reliable(lyrics_elem, verbose=True)
+                    if current_lyrics is None:
+                        self.log("[WARN] Could not reliably read current lyrics state for restore")
+                    elif current_lyrics != self._saved_lyrics_on:
+                        self.log(
+                            f"[RESTORE] Lyrics: current={'ON' if current_lyrics else 'OFF'}, "
+                            f"target={'ON' if self._saved_lyrics_on else 'OFF'} — toggling via UIA Toggle()"
+                        )
+                        tog_pat = lyrics_elem.GetCurrentPattern(_UIA.UIA_TogglePatternId)
+                        toggle_client = tog_pat.QueryInterface(_UIA.IUIAutomationTogglePattern)
+                        toggle_client.Toggle()
+                        if self._sleep(0.3):
+                            return
+                        # Verify
+                        verify_state = self._read_lyrics_state_reliable(lyrics_elem, verbose=True)
+                        self.log(
+                            f"[RESTORE] Lyrics after Toggle(): "
+                            f"{'ON' if verify_state else 'OFF' if verify_state is not None else 'UNKNOWN'}"
+                        )
                     else:
-                        self.log(f"[RESTORE] Lyrics already {'ON' if current_lyrics_on else 'OFF'}, no change needed")
+                        self.log(f"[RESTORE] Lyrics already {'ON' if current_lyrics else 'OFF'}, no change needed")
                 except Exception as e:
                     self.log(f"[WARN] Lyrics restore error: {e}")
+
         except Exception as e:
             self.log(f"[WARN] State restore error: {e}")
 
     # -- Process management --------------------------------
+
+    def _save_window_placement(self):
+        """Save Spotify's window placement before killing it.
+
+        This records whether the window was minimised, maximised, or in a
+        normal position so we can restore it to the same state after relaunch.
+        """
+        try:
+            window = self.find_spotify_window()
+            if window:
+                hwnd, _ = window
+                placement = win32gui.GetWindowPlacement(hwnd)
+                self._saved_window_placement = placement
+                show_cmd = placement[1]  # showCmd field
+                state_name = {1: "NORMAL", 2: "MINIMIZED", 3: "MAXIMIZED"}.get(show_cmd, f"UNKNOWN({show_cmd})")
+                self.log(f"[FOCUS-GUARD] Saved window placement: showCmd={state_name}")
+            else:
+                self._saved_window_placement = None
+                self.log("[FOCUS-GUARD] No Spotify window to save placement for")
+        except Exception as e:
+            self._saved_window_placement = None
+            self.log(f"[WARN] Could not save window placement: {e}")
+
+    # _suppress_spotify_foreground has been integrated into the launch/placement logic in _tick()
 
     def kill_spotify(self):
         """Terminate all Spotify.exe processes."""
@@ -408,18 +515,37 @@ class SpotifyMonitor:
         return killed
 
     def launch_spotify(self):
-        """Start Spotify again."""
+        """Start Spotify again with --force-renderer-accessibility.
+
+        The --force-renderer-accessibility flag ensures Chromium's renderer
+        process builds a complete accessibility tree, which is required for
+        reliable Lyrics toggle state detection via UIA.
+        """
         if self.spotify_path and os.path.exists(self.spotify_path):
+            cmd = [self.spotify_path, _FORCE_A11Y_FLAG]
             subprocess.Popen(
-                [self.spotify_path],
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            self.log(f"[LAUNCH] Started: {self.spotify_path}")
+            self.log(f"[LAUNCH] Started: {' '.join(cmd)}")
         else:
-            # Fallback: use the spotify: URI protocol
-            os.startfile("spotify:")
-            self.log("[LAUNCH] Started via spotify: protocol")
+            # Fallback: use subprocess with the spotify: URI protocol.
+            # os.startfile cannot pass command-line flags, so we use
+            # cmd /c start to launch the protocol handler.
+            try:
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "spotify:"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                )
+                self.log("[LAUNCH] Started via spotify: protocol (subprocess)")
+            except Exception as e:
+                # Last resort fallback
+                self.log(f"[WARN] subprocess protocol launch failed ({e}), trying os.startfile")
+                os.startfile("spotify:")
+                self.log("[LAUNCH] Started via spotify: protocol (os.startfile)")
 
     # -- Media key -----------------------------------------
 
@@ -473,6 +599,8 @@ class SpotifyMonitor:
         self.log(
             f"Poll {POLL_INTERVAL}s  |  Cooldown {COOLDOWN_PERIOD}s"
         )
+        self.log(f"UIA available: {UIA_AVAILABLE}")
+        self.log(f"Accessibility flag: {_FORCE_A11Y_FLAG}")
         self.log("=" * 50)
 
         # Ensure Spotify is unmuted when monitor starts
@@ -483,7 +611,8 @@ class SpotifyMonitor:
                 self._tick()
             except Exception as e:
                 self.log(f"[ERROR] {e}")
-            time.sleep(POLL_INTERVAL)
+            if self._sleep(POLL_INTERVAL):
+                break
 
         self.log("[STOP] Monitor stopped.")
 
@@ -499,7 +628,7 @@ class SpotifyMonitor:
                 self.status_message = "Waiting for Spotify..."
             return
 
-        _, title = window
+        hwnd, title = window
 
         if title != self.last_seen_title:
             self.last_seen_title = title
@@ -524,12 +653,25 @@ class SpotifyMonitor:
 
         # -- Song playing ----------------------------------
         if self.is_song_title(title):
+            # Track active window focus transitions to avoid periodic UIA polling
+            fg_hwnd = None
+            try:
+                fg_hwnd = win32gui.GetForegroundWindow()
+            except Exception:
+                pass
+            spotify_is_active = (fg_hwnd == hwnd)
+            if spotify_is_active != self._spotify_was_active:
+                self._spotify_was_active = spotify_is_active
+                self.log(f"[STATE-TRACK] Spotify focus changed: active={spotify_is_active} — capturing UI state")
+                self.capture_spotify_ui_state()
+
             if self.state != self.MUSIC_PLAYING:
                 self.log(f"[PLAY] Now playing: {title}")
+                # Also capture once when a new song starts
+                self.capture_spotify_ui_state()
             self.state = self.MUSIC_PLAYING
             self.last_song_title = title
             self.status_message = f"Playing: {title}"
-            self.capture_spotify_ui_state()
             return
 
         # -- Ad detected -----------------------------------
@@ -538,6 +680,27 @@ class SpotifyMonitor:
             self.log(f'[AD] >>> AD DETECTED <<<  Title: "{title}"')
             self.log(f'     Last song: "{self.last_song_title}"')
 
+            # Save the user's currently active window BEFORE we do anything
+            # so we can return focus to it after Spotify restarts, or restore Spotify if it was active.
+            user_fg_hwnd = None
+            self._spotify_was_foreground = False
+            try:
+                user_fg_hwnd = win32gui.GetForegroundWindow()
+                if user_fg_hwnd:
+                    _, active_pid = win32process.GetWindowThreadProcessId(user_fg_hwnd)
+                    _, spotify_pid = win32process.GetWindowThreadProcessId(hwnd)
+                    self._spotify_was_foreground = (active_pid == spotify_pid)
+                self.log(f"[FOCUS-GUARD] Saved user's foreground window: HWND={user_fg_hwnd}, spotify_was_foreground={self._spotify_was_foreground}")
+            except Exception as e:
+                self.log(f"[WARN] Error saving active window: {e}")
+
+            # Capture UI state one last time right before we kill Spotify, to make sure we have the latest volume/lyrics
+            self.log("[STATE-TRACK] Ad detected — performing final pre-kill state capture")
+            self.capture_spotify_ui_state()
+
+            # 0. Save window placement before kill (for restoring window state)
+            self._save_window_placement()
+
             # 1. Instant mute
             self.mute_spotify()
 
@@ -545,25 +708,52 @@ class SpotifyMonitor:
             self.kill_spotify()
             self.state = self.RESTARTING
 
-            # 4. Short wait then relaunch
+            # 3. Short wait then relaunch
             if RESTART_DELAY > 0:
                 self.log(f"[WAIT] Waiting {RESTART_DELAY}s before relaunch...")
-                time.sleep(RESTART_DELAY)
+                if self._sleep(RESTART_DELAY):
+                    return
 
-            # 5. Relaunch
+            # 4. Relaunch (with --force-renderer-accessibility)
             self.launch_spotify()
 
-            # 6. Wait for Spotify window to appear
+            # 5. Wait for Spotify window to appear
             self.log("[WAIT] Waiting for Spotify window...")
             load_deadline = time.time() + LOAD_WAIT_TIME
             loaded = False
+            new_hwnd_info = None
             while time.time() < load_deadline:
-                time.sleep(0.5)
-                if self.find_spotify_window():
+                if self._sleep(0.5):
+                    return
+                new_hwnd_info = self.find_spotify_window()
+                if new_hwnd_info:
                     loaded = True
                     break
             if not loaded:
                 self.log("[WARN] Spotify window not detected within load window")
+
+            # 6. Suppress or position the window based on foreground status
+            if loaded and new_hwnd_info:
+                new_h, _ = new_hwnd_info
+                if not self._spotify_was_foreground:
+                    # Spotify was NOT in the foreground: move it off-screen and show it SW_SHOWNOACTIVATE
+                    # so Chromium builds the UIA tree, but it is invisible to the user and doesn't steal focus.
+                    self.log("[FOCUS-GUARD] Spotify was in background — moving off-screen to build UIA tree silently")
+                    try:
+                        win32gui.SetWindowPos(
+                            new_h, 0, -32000, -32000, 100, 100,
+                            win32con.SWP_NOACTIVATE | win32con.SWP_NOZORDER | win32con.SWP_NOSENDCHANGING
+                        )
+                        win32gui.ShowWindow(new_h, win32con.SW_SHOWNOACTIVATE)
+                    except Exception as e:
+                        self.log(f"[WARN] Failed to position Spotify off-screen: {e}")
+                else:
+                    # Spotify WAS in the foreground: show it normally (on-screen) but SW_SHOWNOACTIVATE for now
+                    self.log("[FOCUS-GUARD] Spotify was in foreground — letting it load on-screen")
+                    try:
+                        win32gui.ShowWindow(new_h, win32con.SW_SHOWNOACTIVATE)
+                    except Exception as e:
+                        self.log(f"[WARN] Failed to show Spotify window: {e}")
 
             # 7. Wait for the player UI to be fully ready
             #    (poll for UIA controls — the window shell appears fast but
@@ -572,21 +762,24 @@ class SpotifyMonitor:
             ui_ready = False
             ui_deadline = time.time() + 15  # max 15s total for UI
             while time.time() < ui_deadline:
-                time.sleep(1.0)
-                lyrics_elem, volume_elem = self._find_uia_player_controls()
+                if self._sleep(1.0):
+                    return
+                lyrics_elem, volume_elem = self._find_uia_player_controls(verbose=True)
                 if lyrics_elem or volume_elem:
                     ui_ready = True
                     self.log("[OK] Player UI controls detected — Spotify is ready")
                     break
             if not ui_ready:
                 self.log("[WARN] Player controls not found — continuing anyway")
-                time.sleep(3)  # fallback fixed wait
+                if self._sleep(3.0):
+                    return
 
             # 8. Resume playback — use audio peak to confirm it's actually playing
             for attempt in range(4):
                 self.send_play_key()
                 self.log(f"[PLAY] Play key sent (attempt {attempt + 1})")
-                time.sleep(1.5)
+                if self._sleep(1.5):
+                    return
                 peak = self.get_spotify_peak_volume()
                 if peak > 0.001:
                     self.log(f"[PLAY] Playback confirmed (audio peak: {peak:.4f})")
@@ -594,7 +787,8 @@ class SpotifyMonitor:
                 self.log(f"[PLAY] No audio yet (peak: {peak:.4f}), retrying...")
 
             # 9. Unmute the new instance
-            time.sleep(0.5)
+            if self._sleep(0.5):
+                return
             self.unmute_spotify()
 
             # 10. Restore saved UI state (volume + lyrics) with retries
@@ -603,7 +797,7 @@ class SpotifyMonitor:
                 self.restore_spotify_ui_state()
                 # Verify volume was restored
                 if self._saved_volume is not None:
-                    _, vol_elem = self._find_uia_player_controls()
+                    _, vol_elem = self._find_uia_player_controls(verbose=True)
                     if vol_elem:
                         try:
                             range_pat = vol_elem.GetCurrentPattern(_UIA.UIA_RangeValuePatternId)
@@ -618,12 +812,14 @@ class SpotifyMonitor:
                             pass
                 else:
                     break
-                time.sleep(1)
+                if self._sleep(1.0):
+                    return
 
             # 11. Check if same song loaded — skip immediately if so
             self.log("[CHECK] Verifying song after restart...")
             for _ in range(5):
-                time.sleep(1.0)
+                if self._sleep(1.0):
+                    return
                 new_window = self.find_spotify_window()
                 if new_window:
                     _, new_title = new_window
@@ -633,7 +829,30 @@ class SpotifyMonitor:
                             self.send_next_key()
                         break
 
-            # 12. Enter cooldown
+            # 12. Restore window placement and focus
+            if loaded and new_hwnd_info:
+                new_h, _ = new_hwnd_info
+                if self._spotify_was_foreground:
+                    self.log(f"[FOCUS-GUARD] Restoring focus and placement to new Spotify HWND {new_h}")
+                    try:
+                        if self._saved_window_placement:
+                            win32gui.SetWindowPlacement(new_h, self._saved_window_placement)
+                        win32gui.ShowWindow(new_h, win32con.SW_SHOWNORMAL)
+                        ctypes.windll.user32.AllowSetForegroundWindow(os.getpid())
+                        win32gui.SetForegroundWindow(new_h)
+                    except Exception as e:
+                        self.log(f"[WARN] Failed to activate Spotify: {e}")
+                else:
+                    self.log(f"[FOCUS-GUARD] Restoring placement and minimizing Spotify HWND {new_h}")
+                    try:
+                        if self._saved_window_placement:
+                            win32gui.SetWindowPlacement(new_h, self._saved_window_placement)
+                        win32gui.ShowWindow(new_h, win32con.SW_SHOWMINNOACTIVE)
+                    except Exception as e:
+                        self.log(f"[WARN] Failed to minimize Spotify: {e}")
+                    self._return_focus(user_fg_hwnd)
+
+            # 13. Enter cooldown
             self.ads_skipped += 1
             self.last_restart_time = time.time()
             self.state = self.COOLDOWN
@@ -642,8 +861,33 @@ class SpotifyMonitor:
                 f"Total ads skipped: {self.ads_skipped}"
             )
 
+    def _return_focus(self, hwnd):
+        """Return keyboard focus to the window the user was in before the restart.
+
+        Spotify grabs the foreground on its own when it launches.  We call this
+        after the full restart sequence so the user ends up back where they were.
+        """
+        if not hwnd:
+            self.log("[FOCUS-GUARD] No previous foreground window to restore")
+            return
+        try:
+            # Verify the target window still exists and is visible
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                self.log(f"[FOCUS-GUARD] Previous window {hwnd} no longer valid/visible — skipping focus restore")
+                return
+            # Allow our process to set the foreground window
+            ctypes.windll.user32.AllowSetForegroundWindow(os.getpid())
+            # Give Spotify a moment to finish its own focus grab, then override it
+            if self._sleep(0.3):
+                return
+            win32gui.SetForegroundWindow(hwnd)
+            self.log(f"[FOCUS-GUARD] Returned focus to previous window (HWND={hwnd})")
+        except Exception as e:
+            self.log(f"[WARN] Could not return focus: {e}")
+
     def stop(self):
         self.running = False
+        self.shutdown_event.set()
         # Ensure Spotify is unmuted when monitor stops
         self.unmute_spotify()
 
@@ -724,7 +968,41 @@ def main():
     # Build the system tray icon
     tray = _build_tray(monitor)
 
-    # Install SIGINT handler so Ctrl+C stops the monitor and tray
+    # Windows Console Control Handler for immediate and graceful shutdown on Ctrl+C / close
+    def console_ctrl_handler(ctrl_type):
+        event_names = {
+            win32con.CTRL_C_EVENT: "CTRL_C_EVENT",
+            win32con.CTRL_BREAK_EVENT: "CTRL_BREAK_EVENT",
+            win32con.CTRL_CLOSE_EVENT: "CTRL_CLOSE_EVENT",
+            win32con.CTRL_LOGOFF_EVENT: "CTRL_LOGOFF_EVENT",
+            win32con.CTRL_SHUTDOWN_EVENT: "CTRL_SHUTDOWN_EVENT",
+        }
+        name = event_names.get(ctrl_type, f"UNKNOWN({ctrl_type})")
+        print(f"[SHUTDOWN] Console control event received: {name}")
+        
+        # Stop monitor thread
+        monitor.stop()
+        
+        # Stop tray icon loop (thread-safely breaks blocking tray.run())
+        try:
+            print("[SHUTDOWN] Stopping system tray icon...")
+            tray.stop()
+        except Exception as e:
+            print(f"[SHUTDOWN] Error stopping tray: {e}")
+            
+        # Return True for Ctrl+C and Break so Windows doesn't terminate us abruptly,
+        # allowing the main thread's cleanup code to run.
+        if ctrl_type in (win32con.CTRL_C_EVENT, win32con.CTRL_BREAK_EVENT):
+            return True
+        return False
+
+    try:
+        win32api.SetConsoleCtrlHandler(console_ctrl_handler, True)
+        print("[INFO] Registered Windows Console Control Handler.")
+    except Exception as e:
+        print(f"[WARN] Failed to set console control handler: {e}")
+
+    # Install SIGINT handler as a fallback
     def _on_sigint(signum, frame):
         print("[INFO] SIGINT received -- shutting down")
         monitor.stop()
@@ -746,6 +1024,7 @@ def main():
         # Fallback if signals are delivered as KeyboardInterrupt
         print("[INFO] KeyboardInterrupt -- shutting down")
     finally:
+        print("[SHUTDOWN] Exiting main loop, cleaning up...")
         monitor.stop()
         thread.join(timeout=3)
         print("[INFO] Goodbye!")
