@@ -16,9 +16,7 @@ COOLDOWN_PERIOD = 240     # Seconds (4 min) cooldown after a restart to avoid lo
 # When an ad plays, title becomes one of these or contains "Advertisement".
 AD_TITLE_EXACT = [
     "Listen to music, ad-free.",
-    "Spotify Free",
-    "Join Premium",    
-	
+    "Join Premium",
 ]
 
 AD_TITLE_CONTAINS = [
