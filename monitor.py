@@ -100,8 +100,9 @@ class SpotifyMonitor:
         self.status_message = "Starting up..."
         self.spotify_path = self._find_spotify_path()
         # Saved pre-restart state
-        self._saved_volume = None        # float 0.0–1.0
+        self._saved_volume = None        # float 0.0–1.0 (UIA slider)
         self._saved_lyrics_on = None     # bool
+        self._saved_session_volume = None # float 0.0–1.0 (pycaw Windows audio session)
         # Window placement saved before kill, for restoring window state after relaunch
         self._saved_window_placement = None
         
@@ -295,6 +296,44 @@ class SpotifyMonitor:
 
     def unmute_spotify(self):
         return self._set_spotify_mute(False)
+
+    def _capture_session_volume(self):
+        """Save Spotify's Windows audio session volume (pycaw) before restart."""
+        try:
+            sessions = AudioUtilities.GetAllSessions()
+            for session in sessions:
+                if (
+                    session.Process
+                    and session.Process.name().lower() == "spotify.exe"
+                ):
+                    volume = session._ctl.QueryInterface(ISimpleAudioVolume)
+                    self._saved_session_volume = volume.GetMasterVolume()
+                    self.log(f"[STATE] Session volume captured: {self._saved_session_volume:.2f}")
+                    return
+        except Exception as e:
+            self.log(f"[WARN] Session volume capture error: {e}")
+
+    def _restore_session_volume(self):
+        """Restore Spotify's Windows audio session volume (pycaw) after restart."""
+        if self._saved_session_volume is None:
+            return
+        try:
+            sessions = AudioUtilities.GetAllSessions()
+            for session in sessions:
+                if (
+                    session.Process
+                    and session.Process.name().lower() == "spotify.exe"
+                ):
+                    volume = session._ctl.QueryInterface(ISimpleAudioVolume)
+                    current = volume.GetMasterVolume()
+                    if abs(current - self._saved_session_volume) > 0.02:
+                        volume.SetMasterVolume(self._saved_session_volume, None)
+                        self.log(f"[RESTORE] Session volume: {current:.2f} -> {self._saved_session_volume:.2f}")
+                    else:
+                        self.log(f"[RESTORE] Session volume already at {current:.2f}")
+                    return
+        except Exception as e:
+            self.log(f"[WARN] Session volume restore error: {e}")
 
     def _ensure_chromium_accessibility(self, hwnd):
         """Force Chromium's renderer process to construct its accessibility tree.
@@ -1003,6 +1042,9 @@ class SpotifyMonitor:
             # 2. Save window placement before kill (for restoring window state)
             self._save_window_placement()
 
+            # 3. Save pycaw session volume before kill
+            self._capture_session_volume()
+
             # 4. Kill immediately (state is already saved, audio is muted)
             self.kill_spotify()
             self.state = self.RESTARTING
@@ -1104,9 +1146,15 @@ class SpotifyMonitor:
                 return
             self.unmute_spotify()
 
+            # 11b. Restore pycaw session volume immediately after unmute
+            self._restore_session_volume()
+
             # 12. Restore and verify saved UI state (volume + lyrics)
             self.log("[RESTORE] Restoring UI state (volume + lyrics)...")
             self._verify_and_fix_ui_state()
+
+            # 12b. Re-apply pycaw session volume after UIA restore (in case UIA slider reset it)
+            self._restore_session_volume()
 
             # 13. Check if same song loaded — skip immediately if so
             self.log("[CHECK] Verifying song after restart...")
