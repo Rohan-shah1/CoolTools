@@ -9,10 +9,10 @@ POLL_INTERVAL = 0.25       # Seconds between window title checks (fast sub-secon
 RESTART_DELAY = 0         # Seconds to wait after killing Spotify before relaunch (0 = immediate)
 LOAD_WAIT_TIME = 12       # Max seconds to wait for Spotify window to appear (polls every 0.5s)
 COOLDOWN_PERIOD = 10      # Seconds anti-loop cooldown after a restart (resumes immediately when music plays)
-AMBIGUOUS_AD_CONFIRM_SECONDS = 2.5 # Seconds an ambiguous title ("Spotify Free" + audio) must persist before treating as an ad (prevents false-positives between songs)
-SONG_TRANSITION_GRACE_SECONDS = 6.0 # After a valid song title is seen, suppress ambiguous-title ad detection for this many seconds.
-                                    # Covers the gap between tracks where Spotify briefly shows "Spotify Free"
-                                    # while the previous track's audio is still audible. Increase if false positives persist.
+AMBIGUOUS_AD_DURATION_SECONDS = 15.0 # How long "Spotify Free" must show WITH audio before it's treated as an ad.
+                                     # Song transitions last 1-5s; real Spotify audio ads last 15-60s.
+                                     # This is the decision boundary. Raise if real ads are missed;
+                                     # lower (min ~8s) only if transitions still false-trigger.
 
 # --- Ad Detection -------------------------------------------------
 # Window titles that indicate an ad is playing.
