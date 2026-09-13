@@ -418,18 +418,13 @@ class SpotifyMonitor:
         is_ambiguous = (t in AMBIGUOUS_TITLES)
         # Check if matches any ad title criteria (using normalized comparison)
         matches_exact = t in AD_TITLE_EXACT_LOWER
-        matches_contains = any(ind in t for ind in AD_TITLE_CONTAINS_LOWER)
+        matched_contains = [ind for ind in AD_TITLE_CONTAINS_LOWER if ind in t]
+        matches_contains = bool(matched_contains)
 
         if not (matches_exact or matches_contains or is_ambiguous):
             # --- 1-tick persistence: if we very recently confirmed a definitive ad title,
             # don't let a rapid title flicker (ad→blank→song within 1-2 polls) fool us
             # into thinking the ad ended.  Re-trigger only for non-ambiguous prior hits.
-            #
-            # IMPORTANT: We only fire the persistence window if the title is NOT a valid
-            # song title (i.e. does not contain ' - ').  Song-to-song transitions briefly
-            # show a non-song, non-ad title (like 'Spotify' or 'Spotify Free') which used
-            # to cause a false positive restart after every track.  Clearing the persistence
-            # window for any song title is handled in is_song_title() callers in _tick().
             if (
                 self._last_confirmed_ad_title is not None
                 and (time.time() - self._last_confirmed_ad_time) < (POLL_INTERVAL * 2.5)
@@ -461,15 +456,16 @@ class SpotifyMonitor:
         #   1. Audio drops to silent  (user paused or track ended cleanly)
         #   2. The ambiguous title changes to something else
         #   3. A valid song title appears in _tick()  (reset done there)
-        #
-        # This makes transitions (1–5 s) NEVER trigger, while real ads
-        # (15–60 s) always trigger — with zero dependence on audio levels.
         # ---------------------------------------------------------------
         if is_ambiguous:
             peak = self.get_spotify_peak_volume()
 
             # Silence → definitely not an ad right now; reset timer.
             if peak <= 0.001:
+                if self._ambiguous_last_title != "":
+                    self.reporter.debug(
+                        f"[STATE-GUARD] Ambiguous title '{title}' audio silent (peak={peak:.4f}) — timer reset"
+                    )
                 self._ambiguous_title_first_seen = 0.0
                 self._ambiguous_last_title = ""
                 return False
@@ -480,8 +476,7 @@ class SpotifyMonitor:
                 self._ambiguous_title_first_seen = time.time()
                 self._ambiguous_last_title = t
                 self.reporter.debug(
-                    f"[STATE-GUARD] Ambiguous title '{title}' appeared with audio — "
-                    f"starting duration timer"
+                    f"[STATE-GUARD] Ambiguous title '{title}' appeared with audio (peak={peak:.4f}) — starting duration timer"
                 )
                 return False
 
@@ -490,20 +485,24 @@ class SpotifyMonitor:
             required = getattr(_config, "AMBIGUOUS_AD_DURATION_SECONDS", 15.0)
             if elapsed < required:
                 self.reporter.debug(
-                    f"[STATE-GUARD] Ambiguous '{title}' persisting with audio — "
+                    f"[STATE-GUARD] Ambiguous '{title}' persisting with audio (peak={peak:.4f}) — "
                     f"{elapsed:.1f}s / {required}s needed"
                 )
                 return False
 
             # Title has been ambiguous + audible for long enough → it is an ad.
             self.reporter.debug(
-                f"[AD] Ambiguous title '{title}' confirmed as ad after {elapsed:.1f}s"
+                f"[AD] Ambiguous title '{title}' confirmed as ad after {elapsed:.1f}s (peak={peak:.4f})"
             )
             self._ambiguous_title_first_seen = 0.0
             self._ambiguous_last_title = ""
             return True
 
         # Non-ambiguous explicit ad title matched.
+        exact_match = t if matches_exact else None
+        self.reporter.debug(
+            f"[AD-MATCH] Explicit ad match: title='{title}' | exact={exact_match!r} | contains={matched_contains}"
+        )
         self._ambiguous_title_first_seen = 0.0
         self._ambiguous_last_title = ""
         # Record this as a confirmed (non-ambiguous) ad for persistence window
@@ -1377,8 +1376,13 @@ class SpotifyMonitor:
         hwnd, title = window
 
         if title != self.last_seen_title:
+            old_title = self.last_seen_title
             self.last_seen_title = title
-            self.reporter.debug(f"Spotify window title: \"{title}\"")
+            peak = self.get_spotify_peak_volume()
+            is_song = self.is_song_title(title)
+            self.reporter.debug(
+                f"[TRACK] Title changed: \"{old_title}\" -> \"{title}\" | Peak audio: {peak:.4f} | IsSong: {is_song} | State: {self.state}"
+            )
 
         # -- Cooldown check --------------------------------
         if self.state == self.COOLDOWN:
@@ -1415,6 +1419,10 @@ class SpotifyMonitor:
             # Valid song title seen — reset ambiguous-title duration timer so
             # the next song-to-song transition starts fresh and never accumulates
             # time across multiple track changes.
+            if self._ambiguous_title_first_seen > 0.0:
+                self.reporter.debug(
+                    f"[TIMER-RESET] Song title appeared: '{title}' — resetting ambiguous timer (was: '{self._ambiguous_last_title}')"
+                )
             self._ambiguous_title_first_seen = 0.0
             self._ambiguous_last_title = ""
 

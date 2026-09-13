@@ -191,6 +191,10 @@ class VerboseConsoleReporter(UserConsoleReporter):
     def status_change(self, status: str) -> None:
         self._write_line("Status", status)
 
+    def ad_detected(self, ad_title: str, last_song: str | None = None) -> None:
+        last = f" | Last song: '{last_song}'" if last_song else ""
+        self._write_line("Ad Detected", f"Triggered by title: '{ad_title}'{last}")
+
     def warning(self, message: str) -> None:
         self._write_line("Warning", message)
 

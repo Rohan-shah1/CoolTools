@@ -53,12 +53,12 @@ CONFIG_HOT_RELOAD_INTERVAL = 20   # polls (× POLL_INTERVAL seconds per reload c
 # Print the normalized title and each tested pattern when no match is found.
 # Useful for diagnosing why a new ad format is not being caught.
 # Set to True temporarily while debugging; False for normal operation.
-VERBOSE_AD_DETECTION = False
+VERBOSE_AD_DETECTION = True
 
 # Enable verbose console output for developers (shows internal debug traces,
 # window tracking, UIA control lookups, audio peak logs, etc.).
 # When False (default), only clean user-relevant events are printed.
-VERBOSE_CONSOLE = False
+VERBOSE_CONSOLE = True
 
 # --- Spotify Path -------------------------------------------------
 # Set to None for auto-detection, or provide a full path like:
