@@ -5,26 +5,60 @@ Adjust these values to fine-tune the tool's behavior.
 """
 
 # --- Timing -------------------------------------------------------
-POLL_INTERVAL = 1.5       # Seconds between window title checks
+POLL_INTERVAL = 0.25       # Seconds between window title checks (fast sub-second detection)
 RESTART_DELAY = 0         # Seconds to wait after killing Spotify before relaunch (0 = immediate)
-LOAD_WAIT_TIME = 5        # Max seconds to wait for Spotify window to appear (polls every 0.5s)
-COOLDOWN_PERIOD = 240     # Seconds (4 min) cooldown after a restart to avoid loops
+LOAD_WAIT_TIME = 12       # Max seconds to wait for Spotify window to appear (polls every 0.5s)
+COOLDOWN_PERIOD = 10      # Seconds anti-loop cooldown after a restart (resumes immediately when music plays)
+AMBIGUOUS_AD_CONFIRM_SECONDS = 2.5 # Seconds an ambiguous title ("Spotify Free" + audio) must persist before treating as an ad (prevents false-positives between songs)
+SONG_TRANSITION_GRACE_SECONDS = 6.0 # After a valid song title is seen, suppress ambiguous-title ad detection for this many seconds.
+                                    # Covers the gap between tracks where Spotify briefly shows "Spotify Free"
+                                    # while the previous track's audio is still audible. Increase if false positives persist.
 
 # --- Ad Detection -------------------------------------------------
 # Window titles that indicate an ad is playing.
 # When music plays, title is "Song Name - Artist Name".
-# When an ad plays, title becomes one of these or contains "Advertisement".
+# When an ad plays, title becomes one of these or contains one of these strings.
+#
+# NOTE: All comparisons are case-insensitive and Unicode-normalized (NFKD),
+# so you do NOT need to add separate entries for em-dash (–) vs hyphen (-).
+# Just use a regular hyphen-minus (-) in your patterns.
 AD_TITLE_EXACT = [
     "Listen to music, ad-free.",
     "Join Premium",
+    "Advertisement",
 ]
 
 AD_TITLE_CONTAINS = [
-    "advertisement",
-    "Sponsored",
-    "Listen to music, ad-free.",
+    # Core ad indicators
+    "advertisement",         # Most common: title is just "Advertisement"
+    "audio ad",              # Some builds use "Audio Ad" as the title
+    "ad from",               # e.g. "Ad from BrandName"
+    "sponsored",             # "Sponsored" label used in some regions
 
+    # Full title variants (use regular hyphens; em-dashes are auto-normalized)
+    "listen to music, ad-free.",   # Prompt to upgrade
+    "advertisement - spotify",     # "Advertisement - Spotify" (with any dash)
+
+    # NOTE: Do NOT add "spotify" or "spotify free" here!
+    # Spotify displays "Spotify Free" when paused or idle.
+    # Those ambiguous titles are verified dynamically via audio detection in monitor.py.
 ]
+
+# --- Reliability -------------------------------------------------
+# Automatically reload config every CONFIG_HOT_RELOAD_INTERVAL polls.
+# Set to True so that changes to this file take effect without restarting.
+CONFIG_HOT_RELOAD = True
+CONFIG_HOT_RELOAD_INTERVAL = 20   # polls (× POLL_INTERVAL seconds per reload cycle)
+
+# Print the normalized title and each tested pattern when no match is found.
+# Useful for diagnosing why a new ad format is not being caught.
+# Set to True temporarily while debugging; False for normal operation.
+VERBOSE_AD_DETECTION = False
+
+# Enable verbose console output for developers (shows internal debug traces,
+# window tracking, UIA control lookups, audio peak logs, etc.).
+# When False (default), only clean user-relevant events are printed.
+VERBOSE_CONSOLE = False
 
 # --- Spotify Path -------------------------------------------------
 # Set to None for auto-detection, or provide a full path like:

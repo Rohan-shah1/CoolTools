@@ -13,6 +13,8 @@ import time
 import subprocess
 import ctypes
 import threading
+import importlib
+import unicodedata
 from datetime import datetime
 import comtypes.client
 
@@ -47,28 +49,79 @@ try:
 except Exception:
     UIA_AVAILABLE = False
 
-# System tray
 import pystray
 from PIL import Image, ImageDraw
 import signal
 
+from reporter import (
+    BaseReporter,
+    UserConsoleReporter,
+    VerboseConsoleReporter,
+    NullReporter,
+    LogLevel,
+)
+
+import config as _config
 from config import (
     POLL_INTERVAL,
     RESTART_DELAY,
     LOAD_WAIT_TIME,
     COOLDOWN_PERIOD,
-    AD_TITLE_EXACT,
-    AD_TITLE_CONTAINS,
     SPOTIFY_EXE_PATH,
 )
 
-# Normalize configurations to lowercase sets to prevent case mismatch bugs
-AD_TITLE_EXACT_LOWER = {t.strip().lower() for t in AD_TITLE_EXACT if t.strip()}
-AD_TITLE_CONTAINS_LOWER = {t.strip().lower() for t in AD_TITLE_CONTAINS if t.strip()}
+# ---------------------------------------------------------------------------
+# Unicode normalizer: collapses all dash/hyphen variants to ASCII '-', strips
+# leading/trailing whitespace, and lowercases.  Applied to both window titles
+# and config patterns so that em-dash (\u2013), en-dash (\u2014), and
+# hyphen-minus (\u002D) all compare equal.
+# ---------------------------------------------------------------------------
+_DASH_TABLE = str.maketrans({
+    "\u2013": "-",   # en-dash
+    "\u2014": "-",   # em-dash
+    "\u2012": "-",   # figure dash
+    "\u2010": "-",   # hyphen
+    "\u2011": "-",   # non-breaking hyphen
+    "\u2015": "-",   # horizontal bar
+    "\uFE58": "-",   # small em-dash
+    "\uFE63": "-",   # small hyphen-minus
+    "\uFF0D": "-",   # fullwidth hyphen-minus
+    "\u2022": "-",   # bullet (sometimes used as separator: "Song • Artist")
+})
 
-# Titles that can represent generic, non-playing Spotify window states (e.g. paused)
-# For these, we will verify if audio is actually playing before treating them as ads.
-AMBIGUOUS_TITLES = {"spotify", "spotify free", "spotify premium", "join premium"}
+
+def _norm(text: str) -> str:
+    """Normalize text for reliable ad-title comparison.
+
+    Steps:
+    1. NFKC Unicode normalization (decomposes ligatures, compatibility forms)
+    2. Replace all Unicode dash variants with ASCII hyphen-minus
+    3. Strip surrounding whitespace and lowercase
+    """
+    return (
+        unicodedata.normalize("NFKC", text)
+        .translate(_DASH_TABLE)
+        .strip()
+        .lower()
+    )
+
+
+def _build_ad_sets():
+    """Build normalized ad-detection sets from the current config module."""
+    exact = {_norm(t) for t in _config.AD_TITLE_EXACT if t.strip()}
+    contains = {_norm(t) for t in _config.AD_TITLE_CONTAINS if t.strip()}
+    return exact, contains
+
+
+# Module-level sets — rebuilt on config hot-reload
+AD_TITLE_EXACT_LOWER, AD_TITLE_CONTAINS_LOWER = _build_ad_sets()
+
+# Titles that represent generic, non-playing Spotify window states (e.g. paused or idle).
+# For these, we verify if audio is actually playing before treating them as ads.
+# When Spotify is paused or idle on Spotify Free, the window title is "Spotify Free" or "Spotify"
+# with zero audio output (peak <= 0.001).
+# When an audio ad plays with these titles, audio output is active (peak > 0.001).
+AMBIGUOUS_TITLES = {"spotify", "spotify free", "spotify premium"}
 
 # Chromium flag required for reliable accessibility tree exposure.
 # Without this, the Lyrics button's ToggleState can be stale or missing.
@@ -90,7 +143,14 @@ class SpotifyMonitor:
     RESTARTING = "RESTARTING"
     COOLDOWN = "COOLDOWN"
 
-    def __init__(self):
+    def __init__(self, reporter: BaseReporter | None = None):
+        if reporter is not None:
+            self.reporter = reporter
+        elif getattr(_config, "VERBOSE_CONSOLE", False):
+            self.reporter = VerboseConsoleReporter()
+        else:
+            self.reporter = UserConsoleReporter()
+
         self.state = self.IDLE
         self.last_song_title = None
         self.last_seen_title = None
@@ -105,13 +165,52 @@ class SpotifyMonitor:
         self._saved_session_volume = None # float 0.0–1.0 (pycaw Windows audio session)
         # Window placement saved before kill, for restoring window state after relaunch
         self._saved_window_placement = None
-        
+
         # Track whether Spotify is active to perform event-driven UI state captures
         self._spotify_was_active = False
 
         # Counter for ambiguous ad title verification ticks
         self._ambiguous_ad_ticks = 0
-        
+
+        # Timestamp of the last tick where a valid song title ("Song - Artist") was seen.
+        # Used to suppress false-positive ambiguous-title ad detections during the
+        # brief window between tracks where Spotify shows "Spotify" / "Spotify Free"
+        # while the previous song's audio tail is still audible (peak > 0.001).
+        # Without this guard, every normal song-to-song transition triggers a restart.
+        self._last_song_seen_time: float = 0.0
+
+        # --- 1-tick ad-title persistence ---
+        # Stores the last definitively-confirmed ad title + timestamp so that
+        # a rapid title flicker (ad → blank/song within 2–3 polls) still triggers
+        # a restart instead of being silently ignored.
+        self._last_confirmed_ad_title: str | None = None
+        self._last_confirmed_ad_time: float = 0.0
+
+        # --- Config hot-reload ---
+        self._config_reload_poll_count: int = 0
+
+        # Whether Spotify was the foreground app at the time an ad was detected.
+        # Initialised here so any early-exit code path in _tick() never raises
+        # AttributeError when reading this attribute in the final focus-restore step.
+        self._spotify_was_foreground: bool = False
+
+        # Tracks whether Spotify is currently muted by us.  Lets stop() safely
+        # undo a mute that was applied before a restart completed (quit mid-restart).
+        self._muted: bool = False
+
+        # Guard flag: while True, capture_spotify_ui_state() will not overwrite
+        # _saved_lyrics_on/_saved_volume or emit State lines.  Set during the
+        # post-restart restore sequence so that an in-flight async capture cannot
+        # clobber the pre-restart saved state with stale post-restart readings.
+        self._restoring_ui: bool = False
+
+        # Cached window info for zero-overhead instant polling (<0.01ms checks)
+        self._cached_spotify_hwnd: int | None = None
+        self._cached_spotify_pid: int | None = None
+
+        # Lock to ensure background UI state capture doesn't overlap or block main loop
+        self._ui_capture_lock = threading.Lock()
+
         # Shutdown event for responsive thread termination
         self.shutdown_event = threading.Event()
 
@@ -167,19 +266,61 @@ class SpotifyMonitor:
     # -- Window detection ----------------------------------
 
     def find_spotify_window(self):
-        """Return (hwnd, title) of Spotify's main window, or None."""
-        results = []
+        """Return (hwnd, title) of Spotify's main window, or None.
+
+        Selection strategy:
+        1. Fast-path: check cached Spotify window handle first (instant <0.01ms check).
+        2. Prefer windows with WS_CAPTION style that are NOT child windows —
+           these are the real top-level Spotify frame (works correctly even when
+           the ad title is very short, e.g. 'Advertisement').
+        3. Among candidates of the same priority, pick the one with the longest
+           title (heuristic that picks the song-title window over 'Spotify').
+        4. Fall back to any visible Spotify window if no main-window found.
+        """
+        # Fast path: check cached window handle first (instant <0.01ms check)
+        if self._cached_spotify_hwnd:
+            try:
+                if win32gui.IsWindow(self._cached_spotify_hwnd) and win32gui.IsWindowVisible(self._cached_spotify_hwnd):
+                    _, pid = win32process.GetWindowThreadProcessId(self._cached_spotify_hwnd)
+                    if pid == self._cached_spotify_pid:
+                        title = win32gui.GetWindowText(self._cached_spotify_hwnd)
+                        if title:
+                            return (self._cached_spotify_hwnd, title)
+            except Exception:
+                pass
+            self._cached_spotify_hwnd = None
+            self._cached_spotify_pid = None
+
+        WS_CAPTION = 0x00C00000  # title bar + border
+        WS_CHILD   = 0x40000000  # child window flag
+        GWL_STYLE  = -16
+
+        main_windows  = []  # top-level windows with WS_CAPTION
+        other_windows = []  # remaining visible Spotify windows
 
         def _enum_cb(hwnd, _):
             if not win32gui.IsWindowVisible(hwnd):
                 return True
             try:
+                # Fast class filter: Spotify windows use Chrome_WidgetWin classes or contain Spotify
+                class_name = win32gui.GetClassName(hwnd)
+                if not (class_name.startswith("Chrome_WidgetWin") or "spotify" in class_name.lower()):
+                    return True
+
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 proc = psutil.Process(pid)
                 if proc.name().lower() == "spotify.exe":
                     title = win32gui.GetWindowText(hwnd)
-                    if title:  # skip blank child windows
-                        results.append((hwnd, title))
+                    if title:  # skip blank helper windows
+                        try:
+                            style = win32gui.GetWindowLong(hwnd, GWL_STYLE)
+                            is_main = bool(style & WS_CAPTION) and not bool(style & WS_CHILD)
+                        except Exception:
+                            is_main = False
+                        if is_main:
+                            main_windows.append((hwnd, title, pid))
+                        else:
+                            other_windows.append((hwnd, title, pid))
             except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
                 pass
             return True
@@ -189,11 +330,17 @@ class SpotifyMonitor:
         except Exception:
             pass
 
-        if not results:
-            return None
+        selected = None
+        if main_windows:
+            selected = max(main_windows, key=lambda r: len(r[1]))
+        elif other_windows:
+            selected = max(other_windows, key=lambda r: len(r[1]))
 
-        # The main window usually has the longest title
-        return max(results, key=lambda r: len(r[1]))
+        if selected:
+            self._cached_spotify_hwnd = selected[0]
+            self._cached_spotify_pid = selected[2]
+            return (selected[0], selected[1])
+        return None
 
     # -- Ad detection helpers ------------------------------
 
@@ -202,13 +349,27 @@ class SpotifyMonitor:
         """Does this window title indicate an ad?"""
         if not title:
             return False
-        t = title.strip().lower()
+        t = _norm(title)
 
         if t in AD_TITLE_EXACT_LOWER:
             return True
         for indicator in AD_TITLE_CONTAINS_LOWER:
             if indicator in t:
                 return True
+
+        # --- Verbose near-miss diagnostics ---
+        try:
+            if _config.VERBOSE_AD_DETECTION:
+                import sys
+                print(
+                    f"[AD-DETECT-VERBOSE] No match for normalized title: {t!r}\n"
+                    f"  exact patterns : {sorted(AD_TITLE_EXACT_LOWER)}\n"
+                    f"  contains patterns: {sorted(AD_TITLE_CONTAINS_LOWER)}",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass
+
         return False
 
     @staticmethod
@@ -216,60 +377,126 @@ class SpotifyMonitor:
         """Does this window title look like 'Song - Artist'?"""
         if not title:
             return False
-        t = title.strip().lower()
-        # Song titles contain ' - ' and are NOT the app name
-        return " - " in title and t not in AD_TITLE_EXACT_LOWER
+        t = _norm(title)
+        # Reject known ad-exact titles
+        if t in AD_TITLE_EXACT_LOWER:
+            return False
+        # Reject if any contains-indicator is present.
+        # Guards against titles like "Coldplay - Advertisement" being treated as songs.
+        if any(ind in t for ind in AD_TITLE_CONTAINS_LOWER):
+            return False
+        # Song titles contain ' - ' (after dash normalization)
+        return " - " in t
 
     def get_spotify_peak_volume(self) -> float:
         """Return the current peak volume level of Spotify (0.0 to 1.0), or 0.0 if not found/error."""
+        max_peak = 0.0
         try:
             sessions = AudioUtilities.GetAllSessions()
             for session in sessions:
                 proc = session.Process
                 if proc and proc.name().lower() == "spotify.exe":
-                    meter = session._ctl.QueryInterface(IAudioMeterInformation)
-                    return meter.GetPeakValue()
+                    try:
+                        meter = session._ctl.QueryInterface(IAudioMeterInformation)
+                        peak = meter.GetPeakValue()
+                        if peak > max_peak:
+                            max_peak = peak
+                    except Exception:
+                        pass
         except Exception:
             pass
-        return 0.0
+        return max_peak
 
     def is_ad_playing(self, title: str) -> bool:
         """Determine if an ad is actively playing based on title and audio peak."""
         if not title:
             self._ambiguous_ad_ticks = 0
             return False
-        t = title.strip().lower()
-
-        # Check if matches any ad title criteria
+        t = _norm(title)
+        is_ambiguous = (t in AMBIGUOUS_TITLES)
+        # Check if matches any ad title criteria (using normalized comparison)
         matches_exact = t in AD_TITLE_EXACT_LOWER
         matches_contains = any(ind in t for ind in AD_TITLE_CONTAINS_LOWER)
 
-        if not (matches_exact or matches_contains):
+        if not (matches_exact or matches_contains or is_ambiguous):
+            # --- 1-tick persistence: if we very recently confirmed a definitive ad title,
+            # don't let a rapid title flicker (ad→blank→song within 1-2 polls) fool us
+            # into thinking the ad ended.  Re-trigger only for non-ambiguous prior hits.
+            #
+            # IMPORTANT: We only fire the persistence window if the title is NOT a valid
+            # song title (i.e. does not contain ' - ').  Song-to-song transitions briefly
+            # show a non-song, non-ad title (like 'Spotify' or 'Spotify Free') which used
+            # to cause a false positive restart after every track.  Clearing the persistence
+            # window for any song title is handled in is_song_title() callers in _tick().
+            if (
+                self._last_confirmed_ad_title is not None
+                and (time.time() - self._last_confirmed_ad_time) < (POLL_INTERVAL * 2.5)
+                and " - " not in _norm(title)  # never re-trigger when a song is playing
+            ):
+                self.log(
+                    f"[AD-PERSIST] Title changed to '{title}' within persistence window — "
+                    f"re-asserting last confirmed ad '{self._last_confirmed_ad_title}'"
+                )
+                return True
             self._ambiguous_ad_ticks = 0
             return False
 
-        # If it is an ambiguous title (like the generic app name 'Spotify Free'),
-        # verify it is actually emitting sound and not just a transient title flicker during playback.
-        if t in AMBIGUOUS_TITLES:
+        # If it is an ambiguous title (like the generic app name 'Spotify' or 'Spotify Free'),
+        # verify it is actually emitting sound and not just paused or idle.
+        if is_ambiguous:
             peak = self.get_spotify_peak_volume()
-            # If peak is <= 0.001, it is silent (not playing an ad)
+            # If peak is <= 0.001, it is silent (paused or idle, NOT playing an ad)
             if peak <= 0.001:
                 self._ambiguous_ad_ticks = 0
                 return False
 
-            # If coming from active MUSIC_PLAYING state, require 2 consecutive ticks
-            # of ambiguous title + audio to confirm an ad (prevents false positives from window title flickers)
-            if self.state == self.MUSIC_PLAYING:
-                self._ambiguous_ad_ticks += 1
-                if self._ambiguous_ad_ticks < 2:
-                    self.log(f"[STATE-GUARD] Ambiguous title '{title}' with peak {peak:.4f} detected — confirming (tick {self._ambiguous_ad_ticks}/2)...")
-                    return False
+            # ---------------------------------------------------------------
+            # SONG-TRANSITION GUARD — the most common source of false positives.
+            #
+            # Between two tracks Spotify briefly shows "Spotify" / "Spotify Free"
+            # while buffering the next song.  During this gap the *previous* track's
+            # audio tail is still audible (peak > 0.001), so the audio-presence check
+            # above does not protect us.
+            #
+            # Fix: if we saw a valid song title very recently, this is almost
+            # certainly a normal track transition, NOT an ad.  Reset the tick
+            # counter and wait until the new title appears.
+            #
+            # The grace window is intentionally generous (default 8 s) so it
+            # covers slow-buffering connections.  Real audio ads always appear
+            # AFTER Spotify has had a chance to show the song, so they will
+            # always arrive outside this window.
+            # ---------------------------------------------------------------
+            song_transition_grace = getattr(_config, "SONG_TRANSITION_GRACE_SECONDS", 8.0)
+            time_since_song = time.time() - self._last_song_seen_time
+            if self._last_song_seen_time > 0 and time_since_song < song_transition_grace:
+                self.reporter.debug(
+                    f"[STATE-GUARD] Ambiguous title '{title}' with peak {peak:.4f} — "
+                    f"suppressed: song seen {time_since_song:.1f}s ago (grace={song_transition_grace}s)"
+                )
+                # Reset tick counter so we start fresh once the grace window expires
                 self._ambiguous_ad_ticks = 0
-                return True
+                return False
 
+            # Require consecutive ticks of ambiguous title + audio to confirm an ad
+            # (prevents false positives from transient title flickers between tracks,
+            # which usually take 1.5 - 2.5 seconds to buffer and update window title).
+            confirm_sec = getattr(_config, "AMBIGUOUS_AD_CONFIRM_SECONDS", 2.5)
+            required_ticks = max(4, int(confirm_sec / POLL_INTERVAL))
+            self._ambiguous_ad_ticks += 1
+            if self._ambiguous_ad_ticks < required_ticks:
+                self.reporter.debug(
+                    f"[STATE-GUARD] Ambiguous title '{title}' with peak {peak:.4f} detected — "
+                    f"confirming (tick {self._ambiguous_ad_ticks}/{required_ticks})..."
+                )
+                return False
+            self._ambiguous_ad_ticks = 0
             return True
 
         self._ambiguous_ad_ticks = 0
+        # Record this as a confirmed (non-ambiguous) ad for persistence window
+        self._last_confirmed_ad_title = title
+        self._last_confirmed_ad_time = time.time()
         return True
 
     # -- Audio muting via pycaw ----------------------------
@@ -313,6 +540,21 @@ class SpotifyMonitor:
         except Exception as e:
             self.log(f"[WARN] Session volume capture error: {e}")
 
+    def _get_session_volume(self) -> float | None:
+        """Get Spotify's current Windows audio session volume (0.0 to 1.0) via pycaw."""
+        try:
+            sessions = AudioUtilities.GetAllSessions()
+            for session in sessions:
+                if (
+                    session.Process
+                    and session.Process.name().lower() == "spotify.exe"
+                ):
+                    volume = session._ctl.QueryInterface(ISimpleAudioVolume)
+                    return volume.GetMasterVolume()
+        except Exception:
+            pass
+        return None
+
     def _restore_session_volume(self):
         """Restore Spotify's Windows audio session volume (pycaw) after restart."""
         if self._saved_session_volume is None:
@@ -349,18 +591,41 @@ class SpotifyMonitor:
             pass
 
     def _send_spotify_lyrics_hotkey(self, hwnd=None):
-        """Send Ctrl+N shortcut to Spotify window to toggle lyrics view."""
+        """Send Ctrl+N shortcut to Spotify window to toggle lyrics view.
+
+        Uses WM_KEYDOWN/WM_KEYUP messages posted directly to the Spotify
+        HWND so it works even when Spotify is not the foreground window.
+        Falls back to global keybd_event if no HWND is available.
+        """
         try:
             VK_CONTROL = 0x11
             VK_N = 0x4E
+            WM_KEYDOWN = 0x0100
+            WM_KEYUP = 0x0101
             KEYEVENTF_KEYUP = 0x0002
 
-            # Option A: keybd_event simulation
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_N, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_N, 0, KEYEVENTF_KEYUP, 0)
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-            self.log("[LYRICS-HOTKEY] Sent Ctrl+N lyrics toggle shortcut")
+            # Resolve target HWND
+            target_hwnd = hwnd
+            if not target_hwnd:
+                window = self.find_spotify_window()
+                if window:
+                    target_hwnd = window[0]
+
+            if target_hwnd:
+                # Targeted: post WM_KEY messages directly to Spotify's HWND
+                PostMessage = ctypes.windll.user32.PostMessageW
+                PostMessage(target_hwnd, WM_KEYDOWN, VK_CONTROL, 0)
+                PostMessage(target_hwnd, WM_KEYDOWN, VK_N, 0)
+                PostMessage(target_hwnd, WM_KEYUP, VK_N, 0)
+                PostMessage(target_hwnd, WM_KEYUP, VK_CONTROL, 0)
+                self.log(f"[LYRICS-HOTKEY] Sent Ctrl+N to HWND {target_hwnd}")
+            else:
+                # Fallback: global keybd_event (only works if Spotify is foreground)
+                ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(VK_N, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(VK_N, 0, KEYEVENTF_KEYUP, 0)
+                ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+                self.log("[LYRICS-HOTKEY] Sent Ctrl+N via global keybd_event (no HWND)")
         except Exception as e:
             self.log(f"[WARN] Error sending lyrics hotkey: {e}")
 
@@ -425,21 +690,24 @@ class SpotifyMonitor:
             return None, None
 
     def _read_lyrics_state_reliable(self, lyrics_elem, verbose=False):
-        """Read the Lyrics toggle state reliably checking UIA patterns and properties.
+        """Read the Lyrics toggle state using multiple detection patterns and sampling.
 
-        Returns True (ON), False (OFF), or None if state could not be determined.
+        Rules requested by user:
+        - Checks TogglePattern, SelectionItemPattern, LegacyIAccessible, and Name/AriaProperties.
+        - If EITHER check or sample evaluates to True -> returns True (ON).
+        - Only if BOTH checks/samples evaluate to False -> returns False (OFF).
         """
         if not lyrics_elem:
             return None
 
         def _read_once(elem):
+            results = []
             # 1. Check TogglePattern
             try:
                 tog_pat = elem.GetCurrentPattern(_UIA.UIA_TogglePatternId)
                 if tog_pat:
                     toggle_client = tog_pat.QueryInterface(_UIA.IUIAutomationTogglePattern)
-                    st = toggle_client.CurrentToggleState
-                    return (st == 1)
+                    results.append(toggle_client.CurrentToggleState == 1)
             except Exception:
                 pass
 
@@ -448,7 +716,7 @@ class SpotifyMonitor:
                 sel_pat = elem.GetCurrentPattern(_UIA.UIA_SelectionItemPatternId)
                 if sel_pat:
                     sel_client = sel_pat.QueryInterface(_UIA.IUIAutomationSelectionItemPattern)
-                    return bool(sel_client.CurrentIsSelected)
+                    results.append(bool(sel_client.CurrentIsSelected))
             except Exception:
                 pass
 
@@ -459,44 +727,47 @@ class SpotifyMonitor:
                     leg_client = leg_pat.QueryInterface(_UIA.IUIAutomationLegacyIAccessiblePattern)
                     st = leg_client.CurrentState
                     # STATE_SYSTEM_CHECKED (0x10) or STATE_SYSTEM_PRESSED (0x8)
-                    if st & (0x10 | 0x8):
-                        return True
+                    results.append(bool(st & (0x10 | 0x8)))
             except Exception:
                 pass
 
             # 4. Check Name or AriaProperties heuristic
             try:
                 name = (elem.CurrentName or "").lower()
-                if "hide" in name:
-                    return True
-                if "show" in name:
-                    return False
                 aria = (elem.CurrentAriaProperties or "").lower()
-                if "pressed=true" in aria or "checked=true" in aria:
-                    return True
-                if "pressed=false" in aria or "checked=false" in aria:
-                    return False
+                if "hide" in name or "pressed=true" in aria or "checked=true" in aria:
+                    results.append(True)
+                elif "show" in name or "pressed=false" in aria or "checked=false" in aria:
+                    results.append(False)
             except Exception:
                 pass
 
+            if any(r is True for r in results):
+                return True
+            if any(r is False for r in results):
+                return False
             return None
 
         try:
             state1 = _read_once(lyrics_elem)
-            if state1 is None:
-                return None
-
-            if self._sleep(0.15):
-                return None
+            if self._sleep(0.2):
+                return state1
 
             state2 = _read_once(lyrics_elem)
-            if state1 == state2:
+
+            # User rule: If EITHER sample is True -> ON (True); if BOTH False -> OFF (False)
+            if state1 is True or state2 is True:
                 if verbose:
-                    self.log(f"[LYRICS-DETECT] Lyrics state read: {'ON' if state1 else 'OFF'}")
+                    self.log("[LYRICS-DETECT] Lyrics state read: ON (either check was True)")
+                return True
+            elif state1 is False and state2 is False:
+                if verbose:
+                    self.log("[LYRICS-DETECT] Lyrics state read: OFF (both checks were False)")
+                return False
+            elif state1 is not None:
                 return state1
             else:
-                self.log(f"[LYRICS-DETECT] Lyrics state MISMATCH: state1={state1}, state2={state2} — treating as unreliable")
-                return None
+                return state2
         except Exception as e:
             self.log(f"[LYRICS-DETECT] Error reading toggle state: {e}")
             return None
@@ -504,8 +775,8 @@ class SpotifyMonitor:
     def capture_spotify_ui_state(self):
         """Save current lyrics toggle state and volume level before restart.
 
-        Uses a retry loop with back-off. Preserves existing captured states if
-        controls are temporarily hidden during an ad.
+        Preserves existing captured ON state if previously recorded during music playback,
+        preventing background focus shifts or ad UI changes from overwriting it.
         """
         if not UIA_AVAILABLE:
             return
@@ -520,15 +791,22 @@ class SpotifyMonitor:
                 captured_lyrics = False
                 captured_volume = False
 
+                # Skip overwriting saved state while a post-restart restore is in progress.
+                # The restore sequence sets _restoring_ui=True so that a concurrent
+                # async capture thread cannot clobber the pre-restart saved values with
+                # stale readings from the freshly-launched (not yet restored) Spotify.
+                if self._restoring_ui:
+                    return
+
                 if lyrics_elem:
                     lyrics_on = self._read_lyrics_state_reliable(lyrics_elem)
                     if lyrics_on is not None:
-                        if self._saved_lyrics_on is None or lyrics_on != self._saved_lyrics_on:
+                        if self._saved_lyrics_on != lyrics_on:
                             self._saved_lyrics_on = lyrics_on
                             self.log(f"[STATE] Lyrics is {'ON' if self._saved_lyrics_on else 'OFF'}")
                         captured_lyrics = True
                 elif self._saved_lyrics_on is not None:
-                    # Keep last captured lyrics state if button is temporarily hidden during an ad
+                    # Keep last captured lyrics state if button is temporarily missing
                     captured_lyrics = True
 
                 if volume_elem:
@@ -545,6 +823,11 @@ class SpotifyMonitor:
                 elif self._saved_volume is not None:
                     captured_volume = True
 
+                # Notify reporter of lyric status and volume
+                vol = self._saved_volume if self._saved_volume is not None else self._get_session_volume()
+                if self._saved_lyrics_on is not None or vol is not None:
+                    self.reporter.state_update(self._saved_lyrics_on, vol)
+
                 if captured_lyrics and captured_volume:
                     return
 
@@ -557,6 +840,42 @@ class SpotifyMonitor:
                 if attempt < max_attempts:
                     if self._sleep(retry_delay):
                         return
+
+    def capture_spotify_ui_state_async(self):
+        """Asynchronously capture UI state (lyrics & volume) in background thread.
+
+        Ensures the main ad monitoring loop is never blocked by slow UIA tree inspection.
+        """
+        if not UIA_AVAILABLE:
+            return
+
+        if self._ui_capture_lock.locked():
+            return
+
+        def _worker():
+            if not self._ui_capture_lock.acquire(blocking=False):
+                return
+            co_initialized = False
+            try:
+                try:
+                    import comtypes
+                    comtypes.CoInitialize()
+                    co_initialized = True
+                except Exception:
+                    co_initialized = False
+
+                self.capture_spotify_ui_state()
+            finally:
+                if co_initialized:
+                    try:
+                        import comtypes
+                        comtypes.CoUninitialize()
+                    except Exception:
+                        pass
+                self._ui_capture_lock.release()
+
+        t = threading.Thread(target=_worker, name="UIStateCaptureWorker", daemon=True)
+        t.start()
 
     def restore_spotify_ui_state(self):
         """Restore lyrics toggle state and volume level after Spotify restarts.
@@ -650,7 +969,7 @@ class SpotifyMonitor:
                             self._send_spotify_lyrics_hotkey()
                             toggled = True
 
-                        if self._sleep(0.3):
+                        if self._sleep(0.5):
                             return volume_ok, lyrics_ok
 
                         # Verify
@@ -835,7 +1154,9 @@ class SpotifyMonitor:
     # _suppress_spotify_foreground has been integrated into the launch/placement logic in _tick()
 
     def kill_spotify(self):
-        """Terminate all Spotify.exe processes."""
+        """Send SIGKILL to all Spotify.exe processes."""
+        self._cached_spotify_hwnd = None
+        self._cached_spotify_pid = None
         killed = False
         for proc in psutil.process_iter(["name"]):
             try:
@@ -851,6 +1172,30 @@ class SpotifyMonitor:
             self.log("[KILL] Spotify processes terminated")
         return killed
 
+    def _kill_and_wait(self, timeout: float = 3.0) -> bool:
+        """Kill all Spotify processes and poll until they are fully gone.
+
+        Without this wait, a slow OS may still have the old zombie alive when
+        launch_spotify() fires, resulting in two Spotify instances racing.
+
+        Returns True once all processes are gone (or if shutdown is requested),
+        False if processes were still alive after *timeout* seconds.
+        """
+        self.kill_spotify()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._sleep(0.25):
+                return True  # shutdown requested — caller should also return
+            still_alive = [
+                p for p in psutil.process_iter(["name"])
+                if p.info.get("name", "") and p.info["name"].lower() == "spotify.exe"
+            ]
+            if not still_alive:
+                self.log("[KILL] All Spotify processes confirmed dead")
+                return True
+        self.log(f"[WARN] Spotify processes still alive after {timeout:.1f}s — continuing anyway")
+        return False
+
     def launch_spotify(self):
         """Start Spotify again with --force-renderer-accessibility.
 
@@ -858,6 +1203,13 @@ class SpotifyMonitor:
         process builds a complete accessibility tree, which is required for
         reliable Lyrics toggle state detection via UIA.
         """
+        # Re-attempt path detection: if Spotify was not installed in a standard
+        # location at startup, try to locate it now from running processes.
+        if not self.spotify_path or not os.path.exists(self.spotify_path):
+            self.spotify_path = self._find_spotify_path()
+            if self.spotify_path:
+                self.log(f"[LAUNCH] Spotify path resolved: {self.spotify_path}")
+
         if self.spotify_path and os.path.exists(self.spotify_path):
             cmd = [self.spotify_path, _FORCE_A11Y_FLAG]
             subprocess.Popen(
@@ -915,43 +1267,88 @@ class SpotifyMonitor:
     # -- Logging -------------------------------------------
 
     def log(self, message: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}] {message}"
-        # Safely print even on consoles that don't support Unicode (cp1252)
-        try:
-            print(line)
-        except UnicodeEncodeError:
-            print(line.encode("ascii", errors="replace").decode("ascii"))
         self.status_message = message
+        if not message:
+            return
+        if message.startswith("[ERROR]"):
+            self.reporter.error(message)
+        elif message.startswith("[WARN]"):
+            self.reporter.warning(message)
+        elif message.startswith("[SHUTDOWN]"):
+            self.reporter.shutdown(message)
+        else:
+            self.reporter.debug(message)
 
     # -- Main loop -----------------------------------------
 
+    # -- Config hot-reload ---------------------------------
+
+    def _maybe_reload_config(self):
+        """Periodically reload config.py and rebuild ad-detection sets.
+
+        Controlled by CONFIG_HOT_RELOAD and CONFIG_HOT_RELOAD_INTERVAL in
+        config.py.  Rebuilds the module-level AD_TITLE_EXACT_LOWER and
+        AD_TITLE_CONTAINS_LOWER sets so that changes take effect without
+        restarting the monitor.
+        """
+        global AD_TITLE_EXACT_LOWER, AD_TITLE_CONTAINS_LOWER
+        try:
+            if not getattr(_config, "CONFIG_HOT_RELOAD", False):
+                return
+            interval = getattr(_config, "CONFIG_HOT_RELOAD_INTERVAL", 20)
+            self._config_reload_poll_count += 1
+            if self._config_reload_poll_count < interval:
+                return
+            self._config_reload_poll_count = 0
+            importlib.reload(_config)
+            new_exact, new_contains = _build_ad_sets()
+            if new_exact != AD_TITLE_EXACT_LOWER or new_contains != AD_TITLE_CONTAINS_LOWER:
+                AD_TITLE_EXACT_LOWER = new_exact
+                AD_TITLE_CONTAINS_LOWER = new_contains
+                self.reporter.debug(
+                    f"[CONFIG] Hot-reloaded config.py — "
+                    f"exact={sorted(AD_TITLE_EXACT_LOWER)}, "
+                    f"contains={sorted(AD_TITLE_CONTAINS_LOWER)}"
+                )
+            # Adapt console verbosity dynamically if changed in config.py
+            if not isinstance(self.reporter, NullReporter):
+                verbose = getattr(_config, "VERBOSE_CONSOLE", False)
+                if verbose and not isinstance(self.reporter, VerboseConsoleReporter):
+                    self.reporter = VerboseConsoleReporter()
+                elif not verbose and isinstance(self.reporter, VerboseConsoleReporter):
+                    self.reporter = UserConsoleReporter()
+        except Exception as e:
+            self.reporter.warning(f"Config hot-reload error: {e}")
+
     def run(self):
         """Polling loop - runs in a background thread."""
-        self.log("=" * 50)
-        self.log("Spotify Ad Restarter -- Active")
-        self.log(
-            f"Path: {self.spotify_path or 'protocol handler'}"
+        self.reporter.startup(
+            "Spotify Ad Restarter",
+            {
+                "path": self.spotify_path or "protocol handler",
+                "poll": POLL_INTERVAL,
+                "cooldown": COOLDOWN_PERIOD,
+                "load_wait": LOAD_WAIT_TIME,
+            },
         )
-        self.log(
-            f"Poll {POLL_INTERVAL}s  |  Cooldown {COOLDOWN_PERIOD}s"
+        self.reporter.debug(
+            f"Poll {POLL_INTERVAL}s | Cooldown {COOLDOWN_PERIOD}s | Load wait {LOAD_WAIT_TIME}s | "
+            f"UIA: {UIA_AVAILABLE} | Hot-reload: {getattr(_config, 'CONFIG_HOT_RELOAD', False)}"
         )
-        self.log(f"UIA available: {UIA_AVAILABLE}")
-        self.log(f"Accessibility flag: {_FORCE_A11Y_FLAG}")
-        self.log("=" * 50)
 
         # Ensure Spotify is unmuted when monitor starts
         self.unmute_spotify()
 
         while self.running:
             try:
+                self._maybe_reload_config()
                 self._tick()
             except Exception as e:
-                self.log(f"[ERROR] {e}")
+                self.reporter.error(str(e))
             if self._sleep(POLL_INTERVAL):
                 break
 
-        self.log("[STOP] Monitor stopped.")
+        self.reporter.shutdown("Monitor stopped.")
 
     def _tick(self):
         """Single iteration of the monitor loop."""
@@ -960,7 +1357,7 @@ class SpotifyMonitor:
         # -- No Spotify window -----------------------------
         if not window:
             if self.state not in (self.IDLE, self.RESTARTING):
-                self.log("[WARN] Spotify window not found -- waiting...")
+                self.reporter.status_change("Waiting for Spotify...")
                 self.state = self.IDLE
                 self.status_message = "Waiting for Spotify..."
             return
@@ -969,19 +1366,32 @@ class SpotifyMonitor:
 
         if title != self.last_seen_title:
             self.last_seen_title = title
-            self.log(f"[DEBUG] Spotify window title: \"{title}\"")
+            self.reporter.debug(f"Spotify window title: \"{title}\"")
 
         # -- Cooldown check --------------------------------
         if self.state == self.COOLDOWN:
             elapsed = time.time() - self.last_restart_time
             remaining = COOLDOWN_PERIOD - elapsed
+
+            # If a valid song is already playing, exit cooldown immediately
+            if self.is_song_title(title):
+                self.state = self.MUSIC_PLAYING
+                self.last_song_title = title
+                self.status_message = f"Playing: {title}"
+                self.reporter.song_playing(title)
+                vol = self._saved_volume if self._saved_volume is not None else self._get_session_volume()
+                if self._saved_lyrics_on is not None or vol is not None:
+                    self.reporter.state_update(self._saved_lyrics_on, vol)
+                self.capture_spotify_ui_state_async()
+                return
+
             if remaining > 0:
                 mins, secs = divmod(int(remaining), 60)
                 self.status_message = (
-                    f"Cooldown: {mins}m {secs}s remaining"
+                    f"Cooldown: {mins}m {secs}s remaining" if mins else f"Cooldown: {secs}s remaining"
                 )
                 return
-            self.log("[OK] Cooldown complete -- resuming monitoring")
+            self.reporter.debug("[OK] Cooldown complete -- resuming monitoring")
             self.state = (
                 self.MUSIC_PLAYING
                 if self.is_song_title(title)
@@ -993,6 +1403,19 @@ class SpotifyMonitor:
             # Reset ambiguous ad tick counter when valid song is playing
             self._ambiguous_ad_ticks = 0
 
+            # Stamp the time we last saw a valid song title.
+            # is_ad_playing() uses this to suppress false positives during the
+            # brief inter-track gap where Spotify shows an ambiguous title while
+            # the previous track's audio tail is still audible.
+            self._last_song_seen_time = time.time()
+
+            # Clear the ad-persistence window: a confirmed song title means no ad
+            # is playing, so any pending persistence state is now stale.  Without
+            # this, a song-to-song transition (which briefly shows a non-song,
+            # non-ad title like 'Spotify') would re-trigger a false restart.
+            self._last_confirmed_ad_title = None
+            self._last_confirmed_ad_time = 0.0
+
             # Track active window focus transitions
             fg_hwnd = None
             try:
@@ -1002,12 +1425,15 @@ class SpotifyMonitor:
             spotify_is_active = (fg_hwnd == hwnd)
             if spotify_is_active != self._spotify_was_active:
                 self._spotify_was_active = spotify_is_active
-                self.log(f"[STATE-TRACK] Spotify focus changed: active={spotify_is_active} — capturing UI state")
-                self.capture_spotify_ui_state()
+                self.reporter.debug(f"[STATE-TRACK] Spotify focus changed: active={spotify_is_active} — capturing UI state")
+                self.capture_spotify_ui_state_async()
 
-            if self.state != self.MUSIC_PLAYING:
-                self.log(f"[PLAY] Now playing: {title}")
-                self.capture_spotify_ui_state()
+            if self.state != self.MUSIC_PLAYING or self.last_song_title != title:
+                self.reporter.song_playing(title)
+                vol = self._saved_volume if self._saved_volume is not None else self._get_session_volume()
+                if self._saved_lyrics_on is not None or vol is not None:
+                    self.reporter.state_update(self._saved_lyrics_on, vol)
+                self.capture_spotify_ui_state_async()
 
             self.state = self.MUSIC_PLAYING
             self.last_song_title = title
@@ -1016,14 +1442,21 @@ class SpotifyMonitor:
 
         # -- Ad detected -----------------------------------
         if self.is_ad_playing(title):
+            # Clear persistence window immediately — we are now handling this ad
+            self._last_confirmed_ad_title = None
+            self._last_confirmed_ad_time = 0.0
+
             self.state = self.AD_DETECTED
-            self.log(f'[AD] >>> AD DETECTED <<<  Title: "{title}"')
-            self.log(f'     Last song: "{self.last_song_title}"')
+            self.status_message = f"Ad detected: {title}"
+            self.reporter.ad_detected(title, self.last_song_title)
+            self.reporter.debug(f'[AD] >>> AD DETECTED <<<  Title: "{title}"  (normalized: "{_norm(title)}")')
+            self.reporter.debug(f'     Last song: "{self.last_song_title}"')
 
             # 0. INSTANT MUTE — must be the very first action so the user
             #    never hears any portion of the advertisement.  All state
             #    capture work happens AFTER this.
             self.mute_spotify()
+            self._muted = True
 
             # 1. Save the user's currently active window BEFORE we do anything
             #    so we can return focus to it after Spotify restarts.
@@ -1045,8 +1478,11 @@ class SpotifyMonitor:
             # 3. Save pycaw session volume before kill
             self._capture_session_volume()
 
-            # 4. Kill immediately (state is already saved, audio is muted)
-            self.kill_spotify()
+            # 4. Kill immediately (state is already saved, audio is muted).
+            # _kill_and_wait() polls until all Spotify.exe PIDs vanish so the new
+            # instance doesn't race with a zombie of the old one.
+            if self._kill_and_wait():
+                pass  # returns True on clean exit or shutdown
             self.state = self.RESTARTING
 
             # 5. Short wait then relaunch
@@ -1071,9 +1507,21 @@ class SpotifyMonitor:
                     loaded = True
                     break
             if not loaded:
-                self.log("[WARN] Spotify window not detected within load window")
+                self.log(
+                    "[WARN] Spotify window not detected within load window — "
+                    "aborting restart sequence, returning to IDLE (no cooldown)"
+                )
+                # Do NOT enter cooldown: let the monitor immediately re-try on
+                # the next ad rather than going blind for 4 minutes.
+                self.state = self.IDLE
+                # The new Spotify instance (if any) is still unmuted from its
+                # own launch; clearing our flag avoids a double-unmute in stop().
+                self._muted = False
+                return
 
-            # 8. Restore window placement immediately so Chromium renders on-screen
+            # 8. Restore window placement — but force NORMAL first if it was
+            #    minimized so Chromium builds its accessibility tree for UIA.
+            need_reminimize = False  # track if we need to re-minimize later
             if loaded and new_hwnd_info:
                 new_h, _ = new_hwnd_info
                 self.log(f"[WINDOW-STATE] Restoring window placement immediately to HWND {new_h}")
@@ -1089,30 +1537,43 @@ class SpotifyMonitor:
                         except Exception as e:
                             self.log(f"[WARN] Failed to activate Spotify: {e}")
                     else:
-                        self.log(f"[WINDOW-STATE] Spotify was background — restoring as {state_names.get(saved_cmd, saved_cmd)} without activation")
-                        try:
-                            p = self._saved_window_placement
-                            if saved_cmd == 3:  # MAXIMIZED
-                                win32gui.SetWindowPlacement(new_h, p)
-                            elif saved_cmd == 2:  # MINIMIZED
-                                restore_pl = (p[0], win32con.SW_SHOWMINNOACTIVE, p[2], p[3], p[4])
-                                win32gui.SetWindowPlacement(new_h, restore_pl)
-                            else:  # NORMAL
-                                restore_pl = (p[0], win32con.SW_SHOWNOACTIVATE, p[2], p[3], p[4])
-                                win32gui.SetWindowPlacement(new_h, restore_pl)
-                        except Exception as e:
-                            self.log(f"[WARN] Failed to restore Spotify placement: {e}")
+                        if saved_cmd == 2:  # MINIMIZED
+                            # Chromium doesn't render UI when minimized, so UIA
+                            # cannot find lyrics/volume controls.  Temporarily
+                            # show as NORMAL (off-screen-ish, non-active) so the
+                            # renderer populates the accessibility tree, then
+                            # re-minimize after UI state is restored.
+                            self.log("[WINDOW-STATE] Spotify was MINIMIZED — temporarily showing as NORMAL for UIA access")
+                            try:
+                                p = self._saved_window_placement
+                                temp_pl = (p[0], win32con.SW_SHOWNOACTIVATE, p[2], p[3], p[4])
+                                win32gui.SetWindowPlacement(new_h, temp_pl)
+                                need_reminimize = True
+                            except Exception as e:
+                                self.log(f"[WARN] Failed to temp-show Spotify: {e}")
+                        else:
+                            self.log(f"[WINDOW-STATE] Spotify was background — restoring as {state_names.get(saved_cmd, saved_cmd)} without activation")
+                            try:
+                                p = self._saved_window_placement
+                                if saved_cmd == 3:  # MAXIMIZED
+                                    win32gui.SetWindowPlacement(new_h, p)
+                                else:  # NORMAL
+                                    restore_pl = (p[0], win32con.SW_SHOWNOACTIVATE, p[2], p[3], p[4])
+                                    win32gui.SetWindowPlacement(new_h, restore_pl)
+                            except Exception as e:
+                                self.log(f"[WARN] Failed to restore Spotify placement: {e}")
 
                         # Return focus to previous foreground window
                         self._return_focus(user_fg_hwnd)
                 else:
                     self.log("[WINDOW-STATE] No saved placement to restore")
 
-                # Verify window placement
-                self._verify_and_fix_window_state(new_h)
+                # Verify window placement (skip verify for temp-normal state)
+                if not need_reminimize:
+                    self._verify_and_fix_window_state(new_h)
 
             # 9. Wait for the player UI to be fully ready
-            #    (poll for UIA controls — now available because window is on-screen)
+            #    (now available because window is visible / on-screen)
             self.log("[WAIT] Waiting for player UI to be ready...")
             ui_ready = False
             ui_deadline = time.time() + 15  # max 15s total for UI
@@ -1145,16 +1606,38 @@ class SpotifyMonitor:
             if self._sleep(0.5):
                 return
             self.unmute_spotify()
+            self._muted = False
 
             # 11b. Restore pycaw session volume immediately after unmute
             self._restore_session_volume()
 
             # 12. Restore and verify saved UI state (volume + lyrics)
+            #     Block async captures for the duration so they cannot overwrite
+            #     the saved state with stale readings from the not-yet-restored UI.
             self.log("[RESTORE] Restoring UI state (volume + lyrics)...")
-            self._verify_and_fix_ui_state()
+            self._restoring_ui = True
+            try:
+                self._verify_and_fix_ui_state()
+            finally:
+                self._restoring_ui = False
 
             # 12b. Re-apply pycaw session volume after UIA restore (in case UIA slider reset it)
             self._restore_session_volume()
+
+            # 12c. Re-minimize Spotify if it was originally minimized
+            if need_reminimize and loaded and new_hwnd_info:
+                new_h, _ = new_hwnd_info
+                try:
+                    p = self._saved_window_placement
+                    minimize_pl = (p[0], win32con.SW_SHOWMINNOACTIVE, p[2], p[3], p[4])
+                    win32gui.SetWindowPlacement(new_h, minimize_pl)
+                    self.log("[WINDOW-STATE] Re-minimized Spotify after UI state restore")
+                    # Return focus again in case the temp-show stole it
+                    self._return_focus(user_fg_hwnd)
+                except Exception as e:
+                    self.log(f"[WARN] Failed to re-minimize Spotify: {e}")
+                # Verify final placement
+                self._verify_and_fix_window_state(new_h)
 
             # 13. Check if same song loaded — skip immediately if so
             self.log("[CHECK] Verifying song after restart...")
@@ -1178,10 +1661,20 @@ class SpotifyMonitor:
             self.ads_skipped += 1
             self.last_restart_time = time.time()
             self.state = self.COOLDOWN
-            self.log(
+            self.status_message = f"Cooldown ({COOLDOWN_PERIOD}s)"
+            self.reporter.ad_skipped(self.ads_skipped)
+            self.reporter.debug(
                 f"[COOLDOWN] Started ({COOLDOWN_PERIOD}s)  |  "
                 f"Total ads skipped: {self.ads_skipped}"
             )
+            return
+
+        # -- Neither song nor ad: Spotify is paused or idle -
+        if self.state == self.MUSIC_PLAYING and self._ambiguous_ad_ticks == 0:
+            self.state = self.IDLE
+            self.status_message = "Paused / Idle"
+            self.reporter.status_change("Paused / Idle")
+            self.reporter.debug(f"[IDLE] Playback stopped or paused (title: \"{title}\")")
 
     def _return_focus(self, hwnd):
         """Return keyboard focus to the window the user was in before the restart.
@@ -1210,21 +1703,42 @@ class SpotifyMonitor:
     def stop(self):
         self.running = False
         self.shutdown_event.set()
-        # Ensure Spotify is unmuted when monitor stops
+        # Ensure Spotify is unmuted when monitor stops.
+        # If we were killed mid-restart (_muted=True) the new Spotify instance
+        # may not have its audio session registered yet.  Wait briefly so the
+        # unmute call has something to act on.
+        if self._muted:
+            self.log("[STOP] Muted mid-restart — waiting 2 s before unmute")
+            time.sleep(2.0)
         self.unmute_spotify()
+        self._muted = False
 
 
 # ==========================================================
 #  System tray icon
 # ==========================================================
 
-def _create_tray_image(color=(30, 215, 96)):
-    """Generate a small Spotify-green icon with a play triangle."""
+# Tray icon colours keyed by monitor state
+_TRAY_COLORS = {
+    SpotifyMonitor.MUSIC_PLAYING: (30, 215, 96),   # Spotify green  — playing music
+    SpotifyMonitor.AD_DETECTED:   (220,  50, 50),  # red            — ad detected
+    SpotifyMonitor.RESTARTING:    (220,  50, 50),  # red            — restarting
+    SpotifyMonitor.COOLDOWN:      (255, 160,  0),  # amber          — cooldown period
+    SpotifyMonitor.IDLE:          (120, 120, 120),  # grey           — waiting / idle
+}
+
+
+def _create_tray_image(color=(120, 120, 120)):
+    """Generate a system-tray icon with a play triangle.
+
+    The default color is grey (IDLE state).  Pass a state-specific color from
+    _TRAY_COLORS to visually reflect the monitor's current activity.
+    """
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Green circle background
+    # Coloured circle background
     draw.ellipse([2, 2, size - 2, size - 2], fill=color)
 
     # White play triangle
@@ -1241,7 +1755,7 @@ def _create_tray_image(color=(30, 215, 96)):
 
 
 def _build_tray(monitor: SpotifyMonitor):
-    """Create and return a pystray Icon."""
+    """Create and return a pystray Icon with dynamic state-colour updates."""
 
     def on_quit(icon, item):
         monitor.stop()
@@ -1269,10 +1783,29 @@ def _build_tray(monitor: SpotifyMonitor):
 
     icon = pystray.Icon(
         "spotify_ad_restarter",
-        _create_tray_image(),
+        _create_tray_image(_TRAY_COLORS.get(monitor.state, (120, 120, 120))),
         "Spotify Ad Restarter",
         menu,
     )
+
+    # Background thread: update icon colour whenever monitor state changes.
+    # pystray allows setting icon.icon from any thread.
+    _prev_state: list = [None]
+
+    def _icon_colour_updater():
+        while monitor.running:
+            state = monitor.state
+            if state != _prev_state[0]:
+                _prev_state[0] = state
+                color = _TRAY_COLORS.get(state, (120, 120, 120))
+                try:
+                    icon.icon = _create_tray_image(color)
+                except Exception:
+                    pass
+            time.sleep(0.8)  # check ~every 0.8 s — fast enough to feel responsive
+
+    threading.Thread(target=_icon_colour_updater, daemon=True, name="tray-colour").start()
+
     return icon
 
 
@@ -1300,17 +1833,16 @@ def main():
             win32con.CTRL_SHUTDOWN_EVENT: "CTRL_SHUTDOWN_EVENT",
         }
         name = event_names.get(ctrl_type, f"UNKNOWN({ctrl_type})")
-        print(f"[SHUTDOWN] Console control event received: {name}")
+        monitor.reporter.debug(f"Console control event received: {name}")
         
         # Stop monitor thread
         monitor.stop()
         
         # Stop tray icon loop (thread-safely breaks blocking tray.run())
         try:
-            print("[SHUTDOWN] Stopping system tray icon...")
             tray.stop()
         except Exception as e:
-            print(f"[SHUTDOWN] Error stopping tray: {e}")
+            monitor.reporter.debug(f"Error stopping tray: {e}")
             
         # Return True for Ctrl+C and Break so Windows doesn't terminate us abruptly,
         # allowing the main thread's cleanup code to run.
@@ -1320,13 +1852,11 @@ def main():
 
     try:
         win32api.SetConsoleCtrlHandler(console_ctrl_handler, True)
-        print("[INFO] Registered Windows Console Control Handler.")
     except Exception as e:
-        print(f"[WARN] Failed to set console control handler: {e}")
+        monitor.reporter.debug(f"Failed to set console control handler: {e}")
 
     # Install SIGINT handler as a fallback
     def _on_sigint(signum, frame):
-        print("[INFO] SIGINT received -- shutting down")
         monitor.stop()
         try:
             tray.stop()
@@ -1339,17 +1869,14 @@ def main():
         # Some environments may not allow signal handling; ignore safely
         pass
 
-    print("[INFO] System tray icon active -- right-click to quit.")
     try:
         tray.run()
     except KeyboardInterrupt:
-        # Fallback if signals are delivered as KeyboardInterrupt
-        print("[INFO] KeyboardInterrupt -- shutting down")
+        pass
     finally:
-        print("[SHUTDOWN] Exiting main loop, cleaning up...")
         monitor.stop()
         thread.join(timeout=3)
-        print("[INFO] Goodbye!")
+        monitor.reporter.shutdown("Spotify Ad Restarter stopped. Goodbye!")
 
 
 if __name__ == "__main__":

@@ -10,21 +10,21 @@ A lightweight Windows tool that detects Spotify audio ads, instantly mutes them,
 - 🎤 **Restores lyrics view** — if you had lyrics open, they'll be open again
 - ⚡ **Smart load detection** — resumes as soon as Spotify is ready, not after a fixed delay
 - ⏭️ **Instant same-song skip** — if Spotify reloads the same song that was playing, it skips to the next one immediately
-- 🛡️ **Cooldown period** (4 min) to prevent restart loops
+- 🛡️ **Anti-loop cooldown** (10s) — prevents restart loops, resuming instantly once music plays
 - 🖥️ **System tray icon** — runs silently in the background
 
 ## How It Works
 
-1. **Monitors** Spotify's window title every 1.5 seconds
-2. **Detects** when the title changes from `Song - Artist` to an ad indicator (`Spotify Free`, `Advertisement`, etc.)
+1. **Monitors** Spotify's window title (sub-second polling)
+2. **Detects** when an ad plays (`Advertisement`, `Listen to music, ad-free.`, or ambiguous titles with active audio)
 3. **Captures** current UI state — volume level and lyrics on/off — via Windows UI Automation
 4. **Instantly mutes** Spotify's audio session so you hear nothing
 5. **Kills & restarts** the Spotify process immediately
-6. **Polls** for the new Spotify window every 0.5s (no fixed wait — proceeds as soon as it's ready)
+6. **Polls** for the new Spotify window every 0.5s (proceeds as soon as it's ready)
 7. **Presses Play** to resume your music
 8. **Restores** volume and lyrics to exactly what they were before
 9. **Skips** the track immediately if Spotify reloads the same song
-10. **Enters cooldown** (4 minutes) to avoid restart loops
+10. **Enters anti-loop protection** (resumes monitoring immediately once a song is detected)
 
 ## Setup
 
@@ -53,36 +53,24 @@ Edit [`config.py`](config.py) to adjust behaviour:
 
 | Setting | Default | Description |
 |---|---|---|
-| `POLL_INTERVAL` | `1.5s` | How often to check the window title |
+| `POLL_INTERVAL` | `0.25s` | How often to check the window title |
 | `RESTART_DELAY` | `0s` | Extra wait after killing before relaunching (0 = immediate) |
-| `LOAD_WAIT_TIME` | `5s` | Max time to wait for Spotify window to appear (polls every 0.5s) |
-| `COOLDOWN_PERIOD` | `240s` | Cooldown after each restart to avoid loops |
+| `LOAD_WAIT_TIME` | `12s` | Max time to wait for Spotify window to appear (polls every 0.5s) |
+| `COOLDOWN_PERIOD` | `10s` | Anti-loop cooldown (monitoring resumes immediately when music plays) |
+| `AMBIGUOUS_AD_CONFIRM_SECONDS` | `2.5s` | Time ambiguous titles ("Spotify Free" + audio) must persist before treating as an ad |
+| `VERBOSE_CONSOLE` | `False` | When False, prints only user-relevant notifications. Set True for full debug traces |
 | `SPOTIFY_EXE_PATH` | Auto-detect | Override path to `Spotify.exe` |
 
 ## Console Output
 
-```
-[19:30:01] ==================================================
-[19:30:01] Spotify Ad Restarter -- Active
-[19:30:01] Path: C:\Users\...\Spotify.exe
-[19:30:01] Poll 1.5s  |  Cooldown 240s
-[19:30:01] ==================================================
-[19:30:05] [PLAY] Now playing: i hate u, i love u - gnash
-[19:33:42] [AD] >>> AD DETECTED <<<  Title: "Spotify Free"
-[19:33:42]      Last song: "i hate u, i love u - gnash"
-[19:33:42] [STATE] Capturing UI state before restart...
-[19:33:42] [STATE] Lyrics is ON
-[19:33:42] [STATE] Volume captured: 0.80
-[19:33:42] [MUTE] Spotify muted
-[19:33:42] [KILL] Spotify processes terminated
-[19:33:42] [LAUNCH] Started: C:\Users\...\Spotify.exe
-[19:33:44] [WAIT] Waiting for Spotify to load...
-[19:33:46] [PLAY] Play key sent
-[19:33:47] [UNMUTE] Spotify unmuted
-[19:33:47] [RESTORE] Volume unchanged at 0.80
-[19:33:47] [RESTORE] Lyrics already ON, no change needed
-[19:33:48] [CHECK] Verifying song after restart...
-[19:33:49] [COOLDOWN] Started (240s)  |  Total ads skipped: 1
+By default, the console displays only what the user needs to know (current music playing, lyrics status & volume, and ad restart count):
+
+```text
+[19:30:05] [Playing] Starboy - The Weeknd, Daft Punk
+[19:30:06] [State] Lyrics: ON | Volume: 80%
+[19:33:48] [Ad Detected] Spotify restarted | Total ads skipped: 1
+[19:33:50] [Playing] Blinding Lights - The Weeknd
+[19:33:51] [State] Lyrics: ON | Volume: 80%
 ```
 
 ## Troubleshooting
