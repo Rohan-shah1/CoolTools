@@ -127,6 +127,44 @@ AMBIGUOUS_TITLES = {"spotify", "spotify free", "spotify premium"}
 # Without this, the Lyrics button's ToggleState can be stale or missing.
 _FORCE_A11Y_FLAG = "--force-renderer-accessibility"
 
+# ---------------------------------------------------------------------------
+# Ctypes-based window enumeration
+# ---------------------------------------------------------------------------
+# win32gui.EnumWindows raises pywintypes.error if the Win32 callback returns
+# an error code for *any* window (e.g., ERROR_INSUFFICIENT_BUFFER when an
+# elevated process or game has a very long window title).  We use the raw
+# ctypes API instead, which never propagates individual per-HWND errors.
+# ---------------------------------------------------------------------------
+_user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+_WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_long)
+
+
+def _ctypes_enum_windows(callback):
+    """Enumerate top-level windows via raw ctypes, immune to per-HWND errors.
+
+    *callback(hwnd)* is called for every top-level window.  If the callback
+    returns a falsy value the enumeration stops early (same semantics as the
+    Win32 API).  Any exception raised inside the callback is silently swallowed
+    so that one bad window never aborts the whole scan.
+    """
+    def _inner(hwnd, _lparam):
+        try:
+            return bool(callback(hwnd))
+        except Exception:
+            return True  # keep going
+    cb = _WNDENUMPROC(_inner)
+    _user32.EnumWindows(cb, 0)
+
+
+# WM_APPCOMMAND — lets us send media commands directly to Spotify's HWND
+# rather than broadcasting global keybd_event which can hit browsers / VLC.
+_WM_APPCOMMAND = 0x0319
+_APPCOMMAND_MEDIA_PLAY       = 46   # Play (no toggle)
+_APPCOMMAND_MEDIA_PAUSE      = 47   # Pause (no toggle)
+_APPCOMMAND_MEDIA_PLAY_PAUSE = 14   # Toggle Play/Pause
+_APPCOMMAND_MEDIA_NEXTTRACK  = 11   # Next track
+
 
 
 # ==========================================================
@@ -142,6 +180,7 @@ class SpotifyMonitor:
     AD_DETECTED = "AD_DETECTED"
     RESTARTING = "RESTARTING"
     COOLDOWN = "COOLDOWN"
+    PAUSED = "PAUSED"
 
     def __init__(self, reporter: BaseReporter | None = None):
         if reporter is not None:
@@ -156,6 +195,7 @@ class SpotifyMonitor:
         self.last_seen_title = None
         self.last_restart_time = 0
         self.running = True
+        self.paused = False          # When True: monitoring is suspended by user
         self.ads_skipped = 0
         self.status_message = "Starting up..."
         self.spotify_path = self._find_spotify_path()
@@ -271,12 +311,12 @@ class SpotifyMonitor:
 
         Selection strategy:
         1. Fast-path: check cached Spotify window handle first (instant <0.01ms check).
-        2. Prefer windows with WS_CAPTION style that are NOT child windows —
-           these are the real top-level Spotify frame (works correctly even when
-           the ad title is very short, e.g. 'Advertisement').
-        3. Among candidates of the same priority, pick the one with the longest
-           title (heuristic that picks the song-title window over 'Spotify').
-        4. Fall back to any visible Spotify window if no main-window found.
+        2. Enumerate via ctypes (never raises on elevated/inaccessible windows).
+        3. Prefer windows with WS_CAPTION style that are NOT child windows —
+           these are the real top-level Spotify frame.
+        4. Among candidates of the same priority, pick the one with the longest
+           title (heuristic that selects the song-title window over 'Spotify').
+        5. Fall back to any visible Spotify window if no main-window found.
         """
         # Fast path: check cached window handle first (instant <0.01ms check)
         if self._cached_spotify_hwnd:
@@ -299,37 +339,69 @@ class SpotifyMonitor:
         main_windows  = []  # top-level windows with WS_CAPTION
         other_windows = []  # remaining visible Spotify windows
 
-        def _enum_cb(hwnd, _):
-            if not win32gui.IsWindowVisible(hwnd):
+        # Build the Spotify PID set once so the callback doesn't call psutil
+        # per-window (reduces lock contention and is much faster).
+        spotify_pids: set[int] = set()
+        try:
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    if proc.info["name"] and proc.info["name"].lower() == "spotify.exe":
+                        spotify_pids.add(proc.info["pid"])
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception:
+            pass
+
+        if not spotify_pids:
+            return None
+
+        def _enum_cb(hwnd):
+            if not _user32.IsWindowVisible(hwnd):
                 return True
             try:
-                # Fast class filter: Spotify windows use Chrome_WidgetWin classes or contain Spotify
-                class_name = win32gui.GetClassName(hwnd)
-                if not (class_name.startswith("Chrome_WidgetWin") or "spotify" in class_name.lower()):
+                # GetWindowThreadProcessId via ctypes — never raises
+                pid_val = ctypes.c_ulong(0)
+                _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_val))
+                pid = pid_val.value
+                if pid not in spotify_pids:
                     return True
 
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                proc = psutil.Process(pid)
-                if proc.name().lower() == "spotify.exe":
-                    title = win32gui.GetWindowText(hwnd)
-                    if title:  # skip blank helper windows
-                        try:
-                            style = win32gui.GetWindowLong(hwnd, GWL_STYLE)
-                            is_main = bool(style & WS_CAPTION) and not bool(style & WS_CHILD)
-                        except Exception:
-                            is_main = False
-                        if is_main:
-                            main_windows.append((hwnd, title, pid))
-                        else:
-                            other_windows.append((hwnd, title, pid))
-            except (psutil.NoSuchProcess, psutil.AccessDenied, Exception):
+                # Class name filter: Spotify uses Chrome_WidgetWin classes
+                cls_buf = ctypes.create_unicode_buffer(256)
+                _user32.GetClassNameW(hwnd, cls_buf, 256)
+                class_name = cls_buf.value
+                if not (class_name.startswith("Chrome_WidgetWin") or
+                        "spotify" in class_name.lower()):
+                    return True
+
+                # Title — via ctypes to stay consistent
+                length = _user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True  # skip blank helper windows
+                title_buf = ctypes.create_unicode_buffer(length + 1)
+                _user32.GetWindowTextW(hwnd, title_buf, length + 1)
+                title = title_buf.value
+                if not title:
+                    return True
+
+                # Classify: main frame vs helper
+                try:
+                    style = _user32.GetWindowLongW(hwnd, GWL_STYLE)
+                    is_main = bool(style & WS_CAPTION) and not bool(style & WS_CHILD)
+                except Exception:
+                    is_main = False
+
+                if is_main:
+                    main_windows.append((hwnd, title, pid))
+                else:
+                    other_windows.append((hwnd, title, pid))
+            except Exception:
                 pass
             return True
 
-        try:
-            win32gui.EnumWindows(_enum_cb, None)
-        except Exception:
-            pass
+        # ctypes enumeration — silently tolerates per-HWND errors and
+        # elevated/inaccessible processes (ERROR_INSUFFICIENT_BUFFER / ERROR_ACCESS_DENIED)
+        _ctypes_enum_windows(_enum_cb)
 
         selected = None
         if main_windows:
@@ -647,6 +719,12 @@ class SpotifyMonitor:
 
         Always obtains a fresh element from the current live HWND to avoid
         stale COM proxy references after a Spotify restart.
+
+        Search strategy (fast path first):
+        1. Volume slider — found by Name + ControlType (tiny O(1) condition search).
+        2. Lyrics button — searched by Name/AutomationId/HelpText across
+           buttons and checkboxes only (not the entire document tree).
+           Falls back to a full tree scan only when the fast search misses.
         """
         if not UIA_AVAILABLE:
             if verbose:
@@ -665,28 +743,58 @@ class SpotifyMonitor:
 
             root = _uia_client.ElementFromHandle(hwnd)
 
-            # 1. Search for Volume slider
+            # 1. Volume slider — targeted condition search (fast)
             cond_volume_name = _uia_client.CreatePropertyCondition(_UIA.UIA_NamePropertyId, "Change volume")
-            cond_volume_type = _uia_client.CreatePropertyCondition(_UIA.UIA_ControlTypePropertyId, 50015) # Slider
+            cond_volume_type = _uia_client.CreatePropertyCondition(_UIA.UIA_ControlTypePropertyId, 50015)  # Slider
             cond_volume = _uia_client.CreateAndCondition(cond_volume_name, cond_volume_type)
             volume_elem = root.FindFirst(_UIA.TreeScope_Descendants, cond_volume)
 
-            # 2. Search for Lyrics button across buttons, check boxes, custom elements
+            # 2. Lyrics button — fast path: search only Button + CheckBox controls
+            #    (avoids scanning thousands of non-interactive DOM nodes)
             lyrics_elem = None
-            cond_true = _uia_client.CreateTrueCondition()
-            all_elems = root.FindAll(_UIA.TreeScope_Descendants, cond_true)
-            if all_elems:
-                for i in range(all_elems.Length):
-                    e = all_elems.GetElement(i)
-                    try:
-                        name = (e.CurrentName or "").lower()
-                        auto_id = (e.CurrentAutomationId or "").lower()
-                        help_txt = (e.CurrentHelpText or "").lower()
-                        if "lyric" in name or "lyric" in auto_id or "lyric" in help_txt:
-                            lyrics_elem = e
-                            break
-                    except Exception:
-                        pass
+            for ctrl_type_id in (50000, 50002, 50019):  # Button, CheckBox, Custom
+                try:
+                    cond_type = _uia_client.CreatePropertyCondition(
+                        _UIA.UIA_ControlTypePropertyId, ctrl_type_id
+                    )
+                    elems = root.FindAll(_UIA.TreeScope_Descendants, cond_type)
+                    if not elems:
+                        continue
+                    for i in range(elems.Length):
+                        e = elems.GetElement(i)
+                        try:
+                            name = (e.CurrentName or "").lower()
+                            auto_id = (e.CurrentAutomationId or "").lower()
+                            help_txt = (e.CurrentHelpText or "").lower()
+                            if "lyric" in name or "lyric" in auto_id or "lyric" in help_txt:
+                                lyrics_elem = e
+                                break
+                        except Exception:
+                            pass
+                    if lyrics_elem:
+                        break
+                except Exception:
+                    pass
+
+            # Fallback: full tree scan (slower but catches unusual control types)
+            if not lyrics_elem:
+                try:
+                    cond_true = _uia_client.CreateTrueCondition()
+                    all_elems = root.FindAll(_UIA.TreeScope_Descendants, cond_true)
+                    if all_elems:
+                        for i in range(all_elems.Length):
+                            e = all_elems.GetElement(i)
+                            try:
+                                name = (e.CurrentName or "").lower()
+                                auto_id = (e.CurrentAutomationId or "").lower()
+                                help_txt = (e.CurrentHelpText or "").lower()
+                                if "lyric" in name or "lyric" in auto_id or "lyric" in help_txt:
+                                    lyrics_elem = e
+                                    break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
             if verbose:
                 self.log(
@@ -1194,6 +1302,7 @@ class SpotifyMonitor:
         """
         self.kill_spotify()
         deadline = time.time() + timeout
+        last_log = time.time()
         while time.time() < deadline:
             if self._sleep(0.25):
                 return True  # shutdown requested — caller should also return
@@ -1204,6 +1313,12 @@ class SpotifyMonitor:
             if not still_alive:
                 self.log("[KILL] All Spotify processes confirmed dead")
                 return True
+            # Log a progress dot every second so the console shows activity
+            now = time.time()
+            if now - last_log >= 1.0:
+                elapsed = now - (deadline - timeout)
+                self.log(f"[KILL] Waiting for Spotify to exit... ({elapsed:.0f}s)")
+                last_log = now
         self.log(f"[WARN] Spotify processes still alive after {timeout:.1f}s — continuing anyway")
         return False
 
@@ -1247,33 +1362,49 @@ class SpotifyMonitor:
                 os.startfile("spotify:")
                 self.log("[LAUNCH] Started via spotify: protocol (os.startfile)")
 
-    # -- Media key -----------------------------------------
+    # -- Media commands ------------------------------------
+    # WM_APPCOMMAND targets Spotify's HWND directly so the command is only
+    # consumed by Spotify, never by browsers, VLC, or other media players.
+    # Fallback: global keybd_event when no HWND is available.
 
-    @staticmethod
-    def send_play_key():
-        """Press the Play/Pause media key."""
-        VK_MEDIA_PLAY_PAUSE = 0xB3
-        KEYEVENTF_EXTENDEDKEY = 0x0001
-        KEYEVENTF_KEYUP = 0x0002
-        ctypes.windll.user32.keybd_event(
-            VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY, 0
-        )
-        ctypes.windll.user32.keybd_event(
-            VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0
-        )
+    def _send_appcommand(self, appcommand: int) -> bool:
+        """Send a WM_APPCOMMAND message to Spotify's main window.
 
-    @staticmethod
-    def send_next_key():
-        """Press the Next Track media key."""
-        VK_MEDIA_NEXT_TRACK = 0xB0
-        KEYEVENTF_EXTENDEDKEY = 0x0001
-        KEYEVENTF_KEYUP = 0x0002
-        ctypes.windll.user32.keybd_event(
-            VK_MEDIA_NEXT_TRACK, 0, KEYEVENTF_EXTENDEDKEY, 0
-        )
-        ctypes.windll.user32.keybd_event(
-            VK_MEDIA_NEXT_TRACK, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0
-        )
+        Returns True if the message was posted successfully, False if we fell
+        back to the global keybd_event approach.
+        """
+        window = self.find_spotify_window()
+        if window:
+            hwnd, _ = window
+            # WM_APPCOMMAND lParam encodes the command in bits 16–27.
+            lparam = appcommand << 16
+            try:
+                _user32.PostMessageW(hwnd, _WM_APPCOMMAND, hwnd, lparam)
+                self.log(f"[CMD] WM_APPCOMMAND {appcommand} sent to HWND {hwnd}")
+                return True
+            except Exception as e:
+                self.log(f"[WARN] WM_APPCOMMAND failed: {e}")
+        return False
+
+    def send_play_key(self):
+        """Resume playback via WM_APPCOMMAND or fallback global media key."""
+        if not self._send_appcommand(_APPCOMMAND_MEDIA_PLAY):
+            VK_MEDIA_PLAY_PAUSE = 0xB3
+            KEYEVENTF_EXTENDEDKEY = 0x0001
+            KEYEVENTF_KEYUP = 0x0002
+            _user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY, 0)
+            _user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+            self.log("[CMD] Global Play/Pause media key sent (no HWND)")
+
+    def send_next_key(self):
+        """Skip to next track via WM_APPCOMMAND or fallback global media key."""
+        if not self._send_appcommand(_APPCOMMAND_MEDIA_NEXTTRACK):
+            VK_MEDIA_NEXT_TRACK = 0xB0
+            KEYEVENTF_EXTENDEDKEY = 0x0001
+            KEYEVENTF_KEYUP = 0x0002
+            _user32.keybd_event(VK_MEDIA_NEXT_TRACK, 0, KEYEVENTF_EXTENDEDKEY, 0)
+            _user32.keybd_event(VK_MEDIA_NEXT_TRACK, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+            self.log("[CMD] Global Next Track media key sent (no HWND)")
 
     # -- Logging -------------------------------------------
 
@@ -1352,8 +1483,13 @@ class SpotifyMonitor:
 
         while self.running:
             try:
-                self._maybe_reload_config()
-                self._tick()
+                # When monitoring is paused by the user skip the ad-detection tick.
+                if self.paused:
+                    self.state = self.PAUSED
+                    self.status_message = "Monitoring paused"
+                else:
+                    self._maybe_reload_config()
+                    self._tick()
             except Exception as e:
                 self.reporter.error(str(e))
             if self._sleep(POLL_INTERVAL):
@@ -1742,6 +1878,7 @@ _TRAY_COLORS = {
     SpotifyMonitor.RESTARTING:    (220,  50, 50),  # red            — restarting
     SpotifyMonitor.COOLDOWN:      (255, 160,  0),  # amber          — cooldown period
     SpotifyMonitor.IDLE:          (120, 120, 120),  # grey           — waiting / idle
+    SpotifyMonitor.PAUSED:        ( 80, 120, 200),  # blue           — monitoring paused
 }
 
 
@@ -1778,6 +1915,23 @@ def _build_tray(monitor: SpotifyMonitor):
         monitor.stop()
         icon.stop()
 
+    def on_toggle_pause(icon, item):
+        monitor.paused = not monitor.paused
+        if monitor.paused:
+            monitor.reporter.debug("[TRAY] Monitoring paused by user")
+        else:
+            monitor.reporter.debug("[TRAY] Monitoring resumed by user")
+            monitor.state = monitor.IDLE  # re-enter normal flow
+
+    def on_skip_ad(icon, item):
+        """Manually trigger an ad-skip if Spotify is running."""
+        window = monitor.find_spotify_window()
+        if window:
+            monitor.reporter.debug("[TRAY] Manual Skip Ad triggered")
+            monitor.send_next_key()
+        else:
+            monitor.reporter.debug("[TRAY] Skip Ad: no Spotify window found")
+
     menu = pystray.Menu(
         pystray.MenuItem(
             lambda text: f"Status: {monitor.state}",
@@ -1790,10 +1944,16 @@ def _build_tray(monitor: SpotifyMonitor):
             enabled=False,
         ),
         pystray.MenuItem(
-            lambda text: monitor.status_message,
+            lambda text: monitor.status_message[:60],  # truncate long debug lines
             None,
             enabled=False,
         ),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            lambda text: "Resume Monitoring" if monitor.paused else "Pause Monitoring",
+            on_toggle_pause,
+        ),
+        pystray.MenuItem("Skip Ad / Next Track", on_skip_ad),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", on_quit),
     )

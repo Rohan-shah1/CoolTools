@@ -9,10 +9,10 @@ POLL_INTERVAL = 0.25       # Seconds between window title checks (fast sub-secon
 RESTART_DELAY = 0         # Seconds to wait after killing Spotify before relaunch (0 = immediate)
 LOAD_WAIT_TIME = 12       # Max seconds to wait for Spotify window to appear (polls every 0.5s)
 COOLDOWN_PERIOD = 10      # Seconds anti-loop cooldown after a restart (resumes immediately when music plays)
-AMBIGUOUS_AD_DURATION_SECONDS = 15.0 # How long "Spotify Free" must show WITH audio before it's treated as an ad.
+AMBIGUOUS_AD_DURATION_SECONDS = 8.0  # How long "Spotify Free" must show WITH audio before it's treated as an ad.
                                      # Song transitions last 1-5s; real Spotify audio ads last 15-60s.
-                                     # This is the decision boundary. Raise if real ads are missed;
-                                     # lower (min ~8s) only if transitions still false-trigger.
+                                     # 8s is the safe minimum — below this, crossfades can false-trigger.
+                                     # Raise if real ads are missed; lower only if transitions still false-trigger.
 
 # --- Ad Detection -------------------------------------------------
 # Window titles that indicate an ad is playing.
@@ -53,12 +53,12 @@ CONFIG_HOT_RELOAD_INTERVAL = 20   # polls (× POLL_INTERVAL seconds per reload c
 # Print the normalized title and each tested pattern when no match is found.
 # Useful for diagnosing why a new ad format is not being caught.
 # Set to True temporarily while debugging; False for normal operation.
-VERBOSE_AD_DETECTION = True
+VERBOSE_AD_DETECTION = False
 
 # Enable verbose console output for developers (shows internal debug traces,
 # window tracking, UIA control lookups, audio peak logs, etc.).
 # When False (default), only clean user-relevant events are printed.
-VERBOSE_CONSOLE = True
+VERBOSE_CONSOLE = False
 
 # --- Spotify Path -------------------------------------------------
 # Set to None for auto-detection, or provide a full path like:
