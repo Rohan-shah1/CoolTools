@@ -87,8 +87,7 @@ class UserConsoleReporter(BaseReporter):
     
     Strictly displays ONLY what the user needs:
     1. Current music playing
-    2. Lyric status (ON/OFF) and Volume level
-    3. Spotify restarted and total ads skipped when an ad is detected
+    2. Spotify restarted and total ads skipped when an ad is detected
     All internal traces, startup blurbs, background status, and idle notifications are silenced.
     """
 
@@ -107,43 +106,24 @@ class UserConsoleReporter(BaseReporter):
             print(line.encode("ascii", errors="replace").decode("ascii"))
 
     def startup(self, app_name: str, details: dict | None = None) -> None:
-        # Silenced: user only wants song, lyrics, volume, and ad restart stats
+        # Silenced: user only wants song and ad restart stats
         pass
 
     def song_playing(self, song_title: str) -> None:
         if song_title != self._last_song:
             self._last_song = song_title
             self._write_line("Playing", song_title)
-            # If lyrics already captured from prior track, show state immediately
-            if self._last_lyrics is not None:
-                self._print_state()
 
     def state_update(self, lyrics_on: bool | None, volume: float | None) -> None:
-        """Print lyric status and volume level whenever captured or changed."""
-        changed = False
-        if lyrics_on is not None and lyrics_on != self._last_lyrics:
+        # Silenced: do not print state of lyrics and volume in console
+        if lyrics_on is not None:
             self._last_lyrics = lyrics_on
-            changed = True
         if volume is not None:
-            if self._last_volume is None or abs(volume - self._last_volume) >= 0.02:
-                self._last_volume = volume
-                changed = True
-
-        # Only print state once lyrics state is determined (never print 'Unknown')
-        if changed and (self._last_lyrics is not None):
-            self._print_state()
+            self._last_volume = volume
 
     def _print_state(self) -> None:
-        if self._last_lyrics is not None and self._last_volume is not None:
-            lyrics_str = "ON" if self._last_lyrics else "OFF"
-            vol_str = f"{int(round(self._last_volume * 100))}%"
-            self._write_line("State", f"Lyrics: {lyrics_str} | Volume: {vol_str}")
-        elif self._last_lyrics is not None:
-            lyrics_str = "ON" if self._last_lyrics else "OFF"
-            self._write_line("State", f"Lyrics: {lyrics_str}")
-        elif self._last_volume is not None:
-            vol_str = f"{int(round(self._last_volume * 100))}%"
-            self._write_line("State", f"Volume: {vol_str}")
+        # Silenced: do not print state of lyrics and volume in console
+        pass
 
     def ad_detected(self, ad_title: str, last_song: str | None = None) -> None:
         # Silenced pre-restart: user wants to see the restart message once skipped
@@ -170,8 +150,7 @@ class UserConsoleReporter(BaseReporter):
         pass
 
     def shutdown(self, message: str = "Goodbye!") -> None:
-        # Silenced
-        pass
+        self._write_line("Shutdown", message)
 
     def log(self, message: str, level: LogLevel = LogLevel.INFO) -> None:
         pass

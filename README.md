@@ -47,9 +47,23 @@ python monitor.py
 
 A green play icon will appear in your **system tray** (bottom-right of taskbar). Right-click it to check status or quit.
 
-## Configuration
+## Configuration & Startup Setup
 
-Edit [`config.py`](config.py) to adjust behaviour:
+When you start the program (`python monitor.py`), you are prompted to configure your session preferences:
+
+```text
+========================================
+ Spotify Ad Restarter - Session Setup  
+========================================
+Enter restart volume (0-100) [default: 80]: 80
+Enable lyrics on restart? (y/n) [default: y]: y
+Session configured: Volume = 80% | Lyrics = ON
+========================================
+```
+
+Pressing **Enter** directly accepts the default values configured in [`config.py`](config.py). These settings apply for the entire session. Pressing **Ctrl+C** exits cleanly and unmutes Spotify. When you start the application again, you can configure new settings.
+
+### Default Configuration ([`config.py`](config.py))
 
 | Setting | Default | Description |
 |---|---|---|
@@ -57,20 +71,22 @@ Edit [`config.py`](config.py) to adjust behaviour:
 | `RESTART_DELAY` | `0s` | Extra wait after killing before relaunching (0 = immediate) |
 | `LOAD_WAIT_TIME` | `12s` | Max time to wait for Spotify window to appear (polls every 0.5s) |
 | `COOLDOWN_PERIOD` | `10s` | Anti-loop cooldown (monitoring resumes immediately when music plays) |
-| `AMBIGUOUS_AD_CONFIRM_SECONDS` | `2.5s` | Time ambiguous titles ("Spotify Free" + audio) must persist before treating as an ad |
+| `SONG_TRANSITION_GRACE_SECONDS` | `6.0s` | Transition grace after song ends before checking ambiguous titles |
+| `AMBIGUOUS_AD_DURATION_SECONDS` | `10.0s` | Time ambiguous titles ("Spotify Free" + audio) must persist before treating as an ad |
+| `RESTART_VOLUME` | `80` | Default fixed volume level (0-100) set after restart |
+| `RESTART_LYRICS_ON` | `True` | Default lyrics state (ON/OFF) set after restart |
 | `VERBOSE_CONSOLE` | `False` | When False, prints only user-relevant notifications. Set True for full debug traces |
 | `SPOTIFY_EXE_PATH` | Auto-detect | Override path to `Spotify.exe` |
 
 ## Console Output
 
-By default, the console displays only what the user needs to know (current music playing, lyrics status & volume, and ad restart count):
+By default, the console displays only what the user needs to know (current music playing and ad restart count; no lyrics or volume spam):
 
 ```text
 [19:30:05] [Playing] Starboy - The Weeknd, Daft Punk
-[19:30:06] [State] Lyrics: ON | Volume: 80%
 [19:33:48] [Ad Detected] Spotify restarted | Total ads skipped: 1
 [19:33:50] [Playing] Blinding Lights - The Weeknd
-[19:33:51] [State] Lyrics: ON | Volume: 80%
+[19:35:10] [Shutdown] Spotify Ad Restarter stopped. Goodbye!
 ```
 
 ## Troubleshooting

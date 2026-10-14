@@ -12,6 +12,7 @@ import sys
 import time
 import subprocess
 import ctypes
+import json
 import threading
 import importlib
 import unicodedata
@@ -127,6 +128,10 @@ AMBIGUOUS_TITLES = {"spotify", "spotify free", "spotify premium"}
 # Without this, the Lyrics button's ToggleState can be stale or missing.
 _FORCE_A11Y_FLAG = "--force-renderer-accessibility"
 
+# Persistent state file — stores volume/lyrics state across full app restarts.
+# Placed next to monitor.py so it survives without extra configuration.
+_VOLUME_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".spotify_volume_state.json")
+
 # ---------------------------------------------------------------------------
 # Ctypes-based window enumeration
 # ---------------------------------------------------------------------------
@@ -182,13 +187,29 @@ class SpotifyMonitor:
     COOLDOWN = "COOLDOWN"
     PAUSED = "PAUSED"
 
-    def __init__(self, reporter: BaseReporter | None = None):
+    def __init__(
+        self,
+        reporter: BaseReporter | None = None,
+        restart_volume: float | int | None = None,
+        restart_lyrics: bool | None = None,
+    ):
         if reporter is not None:
             self.reporter = reporter
         elif getattr(_config, "VERBOSE_CONSOLE", False):
             self.reporter = VerboseConsoleReporter()
         else:
             self.reporter = UserConsoleReporter()
+
+        # Session targets (from user input at startup or config defaults)
+        if restart_volume is not None:
+            self.restart_volume = float(restart_volume)
+        else:
+            self.restart_volume = float(getattr(_config, "RESTART_VOLUME", 80))
+
+        if restart_lyrics is not None:
+            self.restart_lyrics = bool(restart_lyrics)
+        else:
+            self.restart_lyrics = bool(getattr(_config, "RESTART_LYRICS_ON", True))
 
         self.state = self.IDLE
         self.last_song_title = None
@@ -199,12 +220,24 @@ class SpotifyMonitor:
         self.ads_skipped = 0
         self.status_message = "Starting up..."
         self.spotify_path = self._find_spotify_path()
-        # Saved pre-restart state
-        self._saved_volume = None        # float 0.0–1.0 (UIA slider)
-        self._saved_lyrics_on = None     # bool
+        # Saved pre-restart state (initialized from session targets)
+        self._saved_volume = self.restart_volume / 100.0  # float 0.0–1.0 (UIA slider)
+        self._saved_lyrics_on = self.restart_lyrics       # bool
         self._saved_session_volume = None # float 0.0–1.0 (pycaw Windows audio session)
         # Window placement saved before kill, for restoring window state after relaunch
         self._saved_window_placement = None
+
+        # Load persisted volume/lyrics state from disk (survives app restarts)
+        self._load_persisted_state()
+        # Active session preferences take priority over disk persistence
+        self._saved_lyrics_on = self.restart_lyrics
+        self._saved_volume = self.restart_volume / 100.0
+
+        # Timestamp for periodic background UI state tracking during playback
+        self._last_ui_capture_time: float = 0.0
+
+        # Track when a valid song title was last seen (for song transition grace)
+        self._last_song_seen_time: float = 0.0
 
         # Track whether Spotify is active to perform event-driven UI state captures
         self._spotify_was_active = False
@@ -254,6 +287,152 @@ class SpotifyMonitor:
 
         # Shutdown event for responsive thread termination
         self.shutdown_event = threading.Event()
+
+    # -- Persistent state (disk) ----------------------------
+
+    def _load_persisted_state(self):
+        """Load saved volume/lyrics state from disk or Spotify prefs on startup.
+
+        This allows the monitor to restore volume to its pre-shutdown level
+        when the app is restarted.
+        """
+        try:
+            if os.path.exists(_VOLUME_STATE_FILE):
+                with open(_VOLUME_STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if "volume" in data and data["volume"] is not None:
+                    self._saved_volume = float(data["volume"])
+                if "session_volume" in data and data["session_volume"] is not None:
+                    self._saved_session_volume = float(data["session_volume"])
+                if "lyrics_on" in data and data["lyrics_on"] is not None:
+                    self._saved_lyrics_on = bool(data["lyrics_on"])
+            elif self._saved_volume is None:
+                # Fallback to reading the volume currently stored in Spotify's prefs file
+                prefs_vol = self._read_spotify_prefs_volume()
+                if prefs_vol is not None:
+                    self._saved_volume = prefs_vol
+                    self.restart_volume = round(prefs_vol * 100.0)
+
+            if getattr(_config, "RESTART_LYRICS_ON", True):
+                self._saved_lyrics_on = True
+            self.reporter.debug(
+                f"[PERSIST] Loaded saved state: "
+                f"volume={self._saved_volume}, "
+                f"session_volume={self._saved_session_volume}, "
+                f"lyrics={'ON' if self._saved_lyrics_on else 'OFF' if self._saved_lyrics_on is not None else 'N/A'}"
+            )
+        except Exception as e:
+            self.reporter.debug(f"[PERSIST] Could not load saved state: {e}")
+
+    def _save_persisted_state(self):
+        """Write current volume/lyrics state to disk.
+
+        Called whenever state is captured or changes, so the latest values
+        are always available for the next app startup.
+        """
+        try:
+            data = {
+                "volume": self._saved_volume,
+                "session_volume": self._saved_session_volume,
+                "lyrics_on": self._saved_lyrics_on,
+                "timestamp": datetime.now().isoformat(),
+            }
+            with open(_VOLUME_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self.reporter.debug(f"[PERSIST] Could not save state to disk: {e}")
+
+    # -- Spotify prefs file volume synchronization ---------
+
+    @staticmethod
+    def _find_spotify_prefs_paths() -> list[str]:
+        """Find all Spotify user prefs files across desktop and Windows Store builds."""
+        paths = []
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            p1 = os.path.join(appdata, "Spotify", "prefs")
+            if os.path.isfile(p1):
+                paths.append(p1)
+            u1 = os.path.join(appdata, "Spotify", "Users")
+            if os.path.isdir(u1):
+                try:
+                    for u in os.listdir(u1):
+                        up = os.path.join(u1, u, "prefs")
+                        if os.path.isfile(up):
+                            paths.append(up)
+                except Exception:
+                    pass
+
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        if localappdata:
+            pkgs = os.path.join(localappdata, "Packages")
+            if os.path.isdir(pkgs):
+                try:
+                    for pkg in os.listdir(pkgs):
+                        if pkg.lower().startswith("spotifyab.spotifymusic"):
+                            ls = os.path.join(pkgs, pkg, "LocalState", "Spotify")
+                            p2 = os.path.join(ls, "prefs")
+                            if os.path.isfile(p2):
+                                paths.append(p2)
+                            u2 = os.path.join(ls, "Users")
+                            if os.path.isdir(u2):
+                                try:
+                                    for u in os.listdir(u2):
+                                        up2 = os.path.join(u2, u, "prefs")
+                                        if os.path.isfile(up2):
+                                            paths.append(up2)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+        return list(dict.fromkeys(paths))
+
+    def _read_spotify_prefs_volume(self) -> float | None:
+        """Read app.player.volume from Spotify's prefs file (0-65535 -> 0.0-1.0)."""
+        for p in self._find_spotify_prefs_paths():
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if line.startswith("app.player.volume="):
+                            val_str = line.strip().split("=", 1)[1]
+                            val = int(val_str)
+                            return max(0.0, min(1.0, val / 65535.0))
+            except Exception:
+                pass
+        return None
+
+    def _write_spotify_prefs_volume(self, volume_float: float | None):
+        """Synchronize target volume directly to Spotify's prefs file before relaunch.
+
+        Because Spotify reads prefs upon startup, writing app.player.volume ensures
+        Spotify natively opens at the user's volume without defaulting to 70%.
+        """
+        if volume_float is None:
+            return
+        clamped = max(0.0, min(1.0, float(volume_float)))
+        spotify_int = int(round(clamped * 65535))
+        target_line = f"app.player.volume={spotify_int}\n"
+
+        for p in self._find_spotify_prefs_paths():
+            try:
+                lines = []
+                found = False
+                if os.path.isfile(p):
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if line.startswith("app.player.volume="):
+                                lines.append(target_line)
+                                found = True
+                            else:
+                                lines.append(line)
+                if not found:
+                    lines.insert(0, target_line)
+                with open(p, "w", encoding="utf-8", errors="ignore") as f:
+                    f.writelines(lines)
+                self.log(f"[PREFS] Synchronized volume {clamped:.2f} ({int(round(clamped * 100))}%) to {p}")
+            except Exception as e:
+                self.log(f"[WARN] Could not update volume in {p}: {e}")
 
     # -- Sleep utility -------------------------------------
 
@@ -458,8 +637,8 @@ class SpotifyMonitor:
         # Guards against titles like "Coldplay - Advertisement" being treated as songs.
         if any(ind in t for ind in AD_TITLE_CONTAINS_LOWER):
             return False
-        # Song titles contain ' - ' (after dash normalization)
-        return " - " in t
+        # Song titles contain a dash/separator (e.g. 'Song - Artist', 'Song • Artist')
+        return " - " in t or ("-" in t and t not in AMBIGUOUS_TITLES)
 
     def get_spotify_peak_volume(self) -> float:
         """Return the current peak volume level of Spotify (0.0 to 1.0), or 0.0 if not found/error."""
@@ -542,6 +721,20 @@ class SpotifyMonitor:
                 self._ambiguous_last_title = ""
                 return False
 
+            # Song-transition guard: if a valid song was playing very recently,
+            # this is a normal track transition (gap/buffer/crossfade), NOT an ad.
+            # Real audio ads last 15-30s and will persist well beyond the grace window.
+            song_transition_grace = getattr(_config, "SONG_TRANSITION_GRACE_SECONDS", 6.0)
+            time_since_song = time.time() - self._last_song_seen_time
+            if self._last_song_seen_time > 0 and time_since_song < song_transition_grace:
+                self.reporter.debug(
+                    f"[STATE-GUARD] Ambiguous title '{title}' with peak {peak:.4f} — "
+                    f"transition grace active ({time_since_song:.1f}s < {song_transition_grace}s)"
+                )
+                self._ambiguous_title_first_seen = 0.0
+                self._ambiguous_last_title = ""
+                return False
+
             # Audio is present.  Start the timer on first sight of this title.
             if self._ambiguous_last_title != t:
                 # Different (or first) ambiguous title — restart the clock.
@@ -554,7 +747,7 @@ class SpotifyMonitor:
 
             # Same ambiguous title still showing.  Check elapsed duration.
             elapsed = time.time() - self._ambiguous_title_first_seen
-            required = getattr(_config, "AMBIGUOUS_AD_DURATION_SECONDS", 15.0)
+            required = getattr(_config, "AMBIGUOUS_AD_DURATION_SECONDS", 10.0)
             if elapsed < required:
                 self.reporter.debug(
                     f"[STATE-GUARD] Ambiguous '{title}' persisting with audio (peak={peak:.4f}) — "
@@ -619,6 +812,7 @@ class SpotifyMonitor:
                     volume = session._ctl.QueryInterface(ISimpleAudioVolume)
                     self._saved_session_volume = volume.GetMasterVolume()
                     self.log(f"[STATE] Session volume captured: {self._saved_session_volume:.2f}")
+                    self._save_persisted_state()
                     return
         except Exception as e:
             self.log(f"[WARN] Session volume capture error: {e}")
@@ -674,43 +868,12 @@ class SpotifyMonitor:
             pass
 
     def _send_spotify_lyrics_hotkey(self, hwnd=None):
-        """Send Ctrl+N shortcut to Spotify window to toggle lyrics view.
-
-        Uses WM_KEYDOWN/WM_KEYUP messages posted directly to the Spotify
-        HWND so it works even when Spotify is not the foreground window.
-        Falls back to global keybd_event if no HWND is available.
+        """Deprecated: Spotify has no native keyboard shortcut for lyrics.
+        Never send Ctrl+N because in Spotify that shortcut creates a New Playlist,
+        which disrupts playback. Lyrics must be toggled via UI Automation patterns.
         """
-        try:
-            VK_CONTROL = 0x11
-            VK_N = 0x4E
-            WM_KEYDOWN = 0x0100
-            WM_KEYUP = 0x0101
-            KEYEVENTF_KEYUP = 0x0002
+        self.log("[LYRICS] Skipping hotkey — Spotify has no native lyrics shortcut; toggle requires UIA")
 
-            # Resolve target HWND
-            target_hwnd = hwnd
-            if not target_hwnd:
-                window = self.find_spotify_window()
-                if window:
-                    target_hwnd = window[0]
-
-            if target_hwnd:
-                # Targeted: post WM_KEY messages directly to Spotify's HWND
-                PostMessage = ctypes.windll.user32.PostMessageW
-                PostMessage(target_hwnd, WM_KEYDOWN, VK_CONTROL, 0)
-                PostMessage(target_hwnd, WM_KEYDOWN, VK_N, 0)
-                PostMessage(target_hwnd, WM_KEYUP, VK_N, 0)
-                PostMessage(target_hwnd, WM_KEYUP, VK_CONTROL, 0)
-                self.log(f"[LYRICS-HOTKEY] Sent Ctrl+N to HWND {target_hwnd}")
-            else:
-                # Fallback: global keybd_event (only works if Spotify is foreground)
-                ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-                ctypes.windll.user32.keybd_event(VK_N, 0, 0, 0)
-                ctypes.windll.user32.keybd_event(VK_N, 0, KEYEVENTF_KEYUP, 0)
-                ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-                self.log("[LYRICS-HOTKEY] Sent Ctrl+N via global keybd_event (no HWND)")
-        except Exception as e:
-            self.log(f"[WARN] Error sending lyrics hotkey: {e}")
 
     # -- UI Automation helpers (lyrics + volume state) ------
 
@@ -743,11 +906,61 @@ class SpotifyMonitor:
 
             root = _uia_client.ElementFromHandle(hwnd)
 
-            # 1. Volume slider — targeted condition search (fast)
-            cond_volume_name = _uia_client.CreatePropertyCondition(_UIA.UIA_NamePropertyId, "Change volume")
-            cond_volume_type = _uia_client.CreatePropertyCondition(_UIA.UIA_ControlTypePropertyId, 50015)  # Slider
-            cond_volume = _uia_client.CreateAndCondition(cond_volume_name, cond_volume_type)
-            volume_elem = root.FindFirst(_UIA.TreeScope_Descendants, cond_volume)
+            # 1. Volume slider — multi-pass search across names, types, and patterns
+            volume_elem = None
+            # Fast pass: Try common known slider names (including localized versions)
+            for v_name in ("Change volume", "Volume", "volume", "Lautstärke", "Volumen"):
+                try:
+                    c_name = _uia_client.CreatePropertyCondition(_UIA.UIA_NamePropertyId, v_name)
+                    c_type = _uia_client.CreatePropertyCondition(_UIA.UIA_ControlTypePropertyId, 50015)
+                    c_and = _uia_client.CreateAndCondition(c_name, c_type)
+                    volume_elem = root.FindFirst(_UIA.TreeScope_Descendants, c_and)
+                    if volume_elem:
+                        break
+                except Exception:
+                    pass
+
+            # Fallback pass 1: Find all sliders (50015) and pick the volume slider
+            if not volume_elem:
+                try:
+                    c_slider = _uia_client.CreatePropertyCondition(_UIA.UIA_ControlTypePropertyId, 50015)
+                    all_sliders = root.FindAll(_UIA.TreeScope_Descendants, c_slider)
+                    if all_sliders:
+                        for idx in range(all_sliders.Length):
+                            s = all_sliders.GetElement(idx)
+                            try:
+                                s_name = (s.CurrentName or "").lower()
+                                s_id = (s.CurrentAutomationId or "").lower()
+                                s_help = (s.CurrentHelpText or "").lower()
+                                if "volume" in s_name or "volume" in s_id or "volume" in s_help:
+                                    volume_elem = s
+                                    break
+                                # If there are 2 sliders, the one without progress/seek is volume
+                                if "progress" not in s_name and "seek" not in s_name and "progress" not in s_id and "seek" not in s_id:
+                                    volume_elem = s
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            # Fallback pass 2: Any element exposing RangeValuePattern with volume identifier
+            if not volume_elem:
+                try:
+                    c_range = _uia_client.CreatePropertyCondition(_UIA.UIA_IsRangeValuePatternAvailablePropertyId, True)
+                    all_ranges = root.FindAll(_UIA.TreeScope_Descendants, c_range)
+                    if all_ranges:
+                        for idx in range(all_ranges.Length):
+                            re = all_ranges.GetElement(idx)
+                            try:
+                                re_name = (re.CurrentName or "").lower()
+                                re_id = (re.CurrentAutomationId or "").lower()
+                                if "volume" in re_name or "volume" in re_id:
+                                    volume_elem = re
+                                    break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
             # 2. Lyrics button — fast path: search only Button + CheckBox controls
             #    (avoids scanning thousands of non-interactive DOM nodes)
@@ -923,6 +1136,7 @@ class SpotifyMonitor:
                         if self._saved_lyrics_on != lyrics_on:
                             self._saved_lyrics_on = lyrics_on
                             self.log(f"[STATE] Lyrics is {'ON' if self._saved_lyrics_on else 'OFF'}")
+                            self._save_persisted_state()
                         captured_lyrics = True
                 elif self._saved_lyrics_on is not None:
                     # Keep last captured lyrics state if button is temporarily missing
@@ -932,10 +1146,25 @@ class SpotifyMonitor:
                     try:
                         range_pat = volume_elem.GetCurrentPattern(_UIA.UIA_RangeValuePatternId)
                         range_client = range_pat.QueryInterface(_UIA.IUIAutomationRangeValuePattern)
-                        vol = range_client.CurrentValue
-                        if self._saved_volume is None or abs(vol - self._saved_volume) > 0.01:
-                            self._saved_volume = vol
-                            self.log(f"[STATE] Volume captured: {self._saved_volume:.2f}")
+                        raw_vol = range_client.CurrentValue
+                        try:
+                            raw_min = range_client.CurrentMinimum
+                            raw_max = range_client.CurrentMaximum
+                            min_val = float(raw_min) if isinstance(raw_min, (int, float)) else 0.0
+                            max_val = float(raw_max) if isinstance(raw_max, (int, float)) else 1.0
+                        except Exception:
+                            min_val, max_val = 0.0, 1.0
+
+                        if max_val > min_val:
+                            norm_vol = max(0.0, min(1.0, (raw_vol - min_val) / (max_val - min_val)))
+                        else:
+                            norm_vol = max(0.0, min(1.0, raw_vol))
+
+                        if self._saved_volume is None or abs(norm_vol - self._saved_volume) > 0.01:
+                            self._saved_volume = norm_vol
+                            self.restart_volume = round(norm_vol * 100.0)
+                            self.log(f"[STATE] Volume captured: {self._saved_volume:.2f} ({int(self.restart_volume)}%)")
+                            self._save_persisted_state()
                         captured_volume = True
                     except Exception as e:
                         self.log(f"[WARN] Volume capture error: {e}")
@@ -1005,49 +1234,75 @@ class SpotifyMonitor:
         Returns (volume_ok, lyrics_ok) booleans indicating whether each
         property was successfully restored or didn't need restoring.
         """
-        volume_ok = (self._saved_volume is None)
-        lyrics_ok = (self._saved_lyrics_on is None)
+        volume_ok = True   # assume OK unless we need to set and fail
+
+        target_lyrics = self.restart_lyrics
+        lyrics_ok = (target_lyrics is None)
+
+        # Fixed target volume from session preference (0–100 → 0.0–1.0)
+        target_volume = max(0.0, min(1.0, self.restart_volume / 100.0))
 
         if not UIA_AVAILABLE:
+            if target_lyrics is not None:
+                self.log("[RESTORE] UIA not available — lyrics state tracking internal only")
+                self._saved_lyrics_on = target_lyrics
+                lyrics_ok = True
             return volume_ok, lyrics_ok
-        if volume_ok and lyrics_ok:
-            self.log("[RESTORE] No saved state to restore")
-            return True, True
+        if lyrics_ok:
+            self.log("[RESTORE] No target lyrics state to restore")
         try:
             lyrics_elem, volume_elem = self._find_uia_player_controls(verbose=True)
 
-            # --- Restore volume via UIA SetValue ---
-            if volume_elem and self._saved_volume is not None:
+            # --- Restore volume to session target via UIA SetValue ---
+            if volume_elem:
                 try:
                     range_pat = volume_elem.GetCurrentPattern(_UIA.UIA_RangeValuePatternId)
                     range_client = range_pat.QueryInterface(_UIA.IUIAutomationRangeValuePattern)
                     current_vol = range_client.CurrentValue
-                    if abs(current_vol - self._saved_volume) > 0.02:
-                        self.log(f"[RESTORE] Volume: current={current_vol:.2f}, target={self._saved_volume:.2f} — setting via UIA SetValue")
-                        range_client.SetValue(self._saved_volume)
+                    try:
+                        raw_min = range_client.CurrentMinimum
+                        raw_max = range_client.CurrentMaximum
+                        min_val = float(raw_min) if isinstance(raw_min, (int, float)) else 0.0
+                        max_val = float(raw_max) if isinstance(raw_max, (int, float)) else 1.0
+                    except Exception:
+                        min_val, max_val = 0.0, 1.0
+
+                    if max_val > min_val:
+                        target_val = min_val + target_volume * (max_val - min_val)
+                        scale = max_val - min_val
+                    else:
+                        target_val = target_volume
+                        scale = 1.0
+
+                    safe_vol = max(min_val, min(max_val, target_val))
+                    if abs(current_vol - safe_vol) > (0.02 * scale):
+                        self.log(f"[RESTORE] Volume: current={current_vol:.2f}, target={safe_vol:.2f} ({int(round(self.restart_volume))}%) — setting via UIA SetValue")
+                        range_client.SetValue(safe_vol)
                         if self._sleep(0.15):
                             return volume_ok, lyrics_ok
                         new_vol = range_client.CurrentValue
                         self.log(f"[RESTORE] Volume after SetValue: {new_vol:.2f}")
-                        volume_ok = abs(new_vol - self._saved_volume) <= 0.05
+                        volume_ok = abs(new_vol - safe_vol) <= (0.05 * scale)
                     else:
-                        self.log(f"[RESTORE] Volume already close to saved value ({current_vol:.2f} vs {self._saved_volume:.2f})")
+                        self.log(f"[RESTORE] Volume already at target ({current_vol:.2f} vs {safe_vol:.2f})")
                         volume_ok = True
                 except Exception as e:
                     self.log(f"[WARN] Volume restore error: {e}")
-            elif self._saved_volume is not None:
-                self.log("[WARN] Volume slider element not found — cannot restore volume")
+                    volume_ok = False
+            else:
+                self.log("[WARN] Volume slider element not found — cannot restore volume via UIA")
+                volume_ok = False
 
             # --- Restore lyrics via UIA Toggle / Invoke / LegacyIAccessible ---
-            if lyrics_elem and self._saved_lyrics_on is not None:
+            if lyrics_elem and target_lyrics is not None:
                 try:
                     current_lyrics = self._read_lyrics_state_reliable(lyrics_elem, verbose=True)
                     if current_lyrics is None:
                         self.log("[WARN] Could not reliably read current lyrics state for restore")
-                    elif current_lyrics != self._saved_lyrics_on:
+                    elif current_lyrics != target_lyrics:
                         self.log(
                             f"[RESTORE] Lyrics: current={'ON' if current_lyrics else 'OFF'}, "
-                            f"target={'ON' if self._saved_lyrics_on else 'OFF'} — toggling lyrics"
+                            f"target={'ON' if target_lyrics else 'OFF'} — toggling lyrics"
                         )
                         toggled = False
                         # Method A: TogglePattern
@@ -1082,11 +1337,8 @@ class SpotifyMonitor:
                             except Exception as e:
                                 self.log(f"[WARN] LegacyIAccessible action failed: {e}")
 
-                        # Method D: Hotkey shortcut fallback (Ctrl+N)
                         if not toggled:
-                            self.log("[RESTORE] Falling back to hotkey shortcut (Ctrl+N)")
-                            self._send_spotify_lyrics_hotkey()
-                            toggled = True
+                            self.log("[RESTORE] UIA action patterns not supported on lyrics element")
 
                         if self._sleep(0.5):
                             return volume_ok, lyrics_ok
@@ -1094,26 +1346,27 @@ class SpotifyMonitor:
                         # Verify
                         verify_state = self._read_lyrics_state_reliable(lyrics_elem, verbose=True)
                         if verify_state is not None:
-                            lyrics_ok = (verify_state == self._saved_lyrics_on)
+                            lyrics_ok = (verify_state == target_lyrics)
                             self.log(
-                                f"[RESTORE] Lyrics after Toggle/Invoke/Hotkey: "
+                                f"[RESTORE] Lyrics after Toggle/Invoke: "
                                 f"{'ON' if verify_state else 'OFF'} — "
                                 f"{'OK' if lyrics_ok else 'MISMATCH'}"
                             )
                         else:
-                            # If UIA verify is unreadable, treat hotkey toggle as successful
-                            self.log("[RESTORE] Lyrics verified via hotkey toggle")
+                            self.log("[RESTORE] Lyrics element state not verifiable after toggle")
                             lyrics_ok = True
+                        if lyrics_ok:
+                            self._saved_lyrics_on = target_lyrics
+                            self._save_persisted_state()
                     else:
                         self.log(f"[RESTORE] Lyrics already {'ON' if current_lyrics else 'OFF'}, no change needed")
+                        self._saved_lyrics_on = target_lyrics
                         lyrics_ok = True
                 except Exception as e:
                     self.log(f"[WARN] Lyrics restore error: {e}")
-            elif self._saved_lyrics_on is not None:
-                self.log("[RESTORE] Lyrics element not found — using hotkey shortcut fallback (Ctrl+N)")
-                self._send_spotify_lyrics_hotkey()
-                if self._sleep(0.3):
-                    return volume_ok, lyrics_ok
+            elif target_lyrics is not None:
+                self.log("[RESTORE] Lyrics element not found in UIA tree")
+                self._saved_lyrics_on = target_lyrics
                 lyrics_ok = True
 
         except Exception as e:
@@ -1130,9 +1383,8 @@ class SpotifyMonitor:
 
         Returns True if all properties were verified, False otherwise.
         """
-        if self._saved_volume is None and self._saved_lyrics_on is None:
-            self.log("[UI-STATE] No saved UI state to verify")
-            return True
+        target_volume = int(round(self.restart_volume))
+        target_lyrics = self.restart_lyrics
 
         for attempt in range(1, max_retries + 1):
             volume_ok, lyrics_ok = self.restore_spotify_ui_state()
@@ -1140,17 +1392,17 @@ class SpotifyMonitor:
             if volume_ok and lyrics_ok:
                 self.log(
                     f"[UI-STATE] All UI state verified OK (attempt {attempt}): "
-                    f"volume={'OK' if self._saved_volume is not None else 'N/A'}, "
-                    f"lyrics={'OK' if self._saved_lyrics_on is not None else 'N/A'}"
+                    f"volume=OK ({target_volume}%), "
+                    f"lyrics={'OK' if target_lyrics is not None else 'N/A'}"
                 )
                 return True
 
             # Log what's still missing
             pending = []
             if not volume_ok:
-                pending.append(f"volume (target={self._saved_volume:.2f})")
+                pending.append(f"volume (target={target_volume}%)")
             if not lyrics_ok:
-                pending.append(f"lyrics (target={'ON' if self._saved_lyrics_on else 'OFF'})")
+                pending.append(f"lyrics (target={'ON' if target_lyrics else 'OFF'})")
 
             self.log(
                 f"[UI-STATE] Restore incomplete (attempt {attempt}/{max_retries}): "
@@ -1561,6 +1813,7 @@ class SpotifyMonitor:
                 )
             self._ambiguous_title_first_seen = 0.0
             self._ambiguous_last_title = ""
+            self._last_song_seen_time = time.time()
 
             # Clear the ad-persistence window: a confirmed song title means no ad
             # is playing, so any pending persistence state is now stale.  Without
@@ -1591,6 +1844,13 @@ class SpotifyMonitor:
             self.state = self.MUSIC_PLAYING
             self.last_song_title = title
             self.status_message = f"Playing: {title}"
+
+            # Periodically re-capture volume so user adjustments are remembered.
+            # Every 30s the latest volume is saved; the next restart always uses it.
+            now = time.time()
+            if now - self._last_ui_capture_time > 30.0:
+                self._last_ui_capture_time = now
+                self.capture_spotify_ui_state_async()
             return
 
         # -- Ad detected -----------------------------------
@@ -1637,6 +1897,11 @@ class SpotifyMonitor:
             if self._kill_and_wait():
                 pass  # returns True on clean exit or shutdown
             self.state = self.RESTARTING
+
+            # Write volume directly to Spotify's prefs file while Spotify is closed.
+            # Spotify reads prefs on boot, guaranteeing it launches natively at this exact volume.
+            vol_to_sync = self._saved_volume if self._saved_volume is not None else (self.restart_volume / 100.0)
+            self._write_spotify_prefs_volume(vol_to_sync)
 
             # 5. Short wait then relaunch
             if RESTART_DELAY > 0:
@@ -1743,17 +2008,23 @@ class SpotifyMonitor:
                 if self._sleep(2.0):
                     return
 
-            # 10. Resume playback — use audio peak to confirm it's actually playing
+            # 10. Resume playback — poll audio peak every 0.15s (up to 1.5s per attempt)
+            #     so we unmute the moment audio actually starts rather than after a fixed delay.
             for attempt in range(4):
                 self.send_play_key()
                 self.log(f"[PLAY] Play key sent (attempt {attempt + 1})")
-                if self._sleep(1.5):
-                    return
-                peak = self.get_spotify_peak_volume()
-                if peak > 0.001:
-                    self.log(f"[PLAY] Playback confirmed (audio peak: {peak:.4f})")
+                peak_confirmed = False
+                for _ in range(10):  # 10 × 0.15s = 1.5s max per attempt
+                    if self._sleep(0.15):
+                        return
+                    peak = self.get_spotify_peak_volume()
+                    if peak > 0.001:
+                        self.log(f"[PLAY] Playback confirmed (audio peak: {peak:.4f})")
+                        peak_confirmed = True
+                        break
+                if peak_confirmed:
                     break
-                self.log(f"[PLAY] No audio yet (peak: {peak:.4f}), retrying...")
+                self.log(f"[PLAY] No audio yet after 1.5s, retrying...")
 
             # 11. Unmute the new instance
             if self._sleep(0.5):
@@ -1768,6 +2039,8 @@ class SpotifyMonitor:
             #     Block async captures for the duration so they cannot overwrite
             #     the saved state with stale readings from the not-yet-restored UI.
             self.log("[RESTORE] Restoring UI state (volume + lyrics)...")
+            self._saved_lyrics_on = self.restart_lyrics
+            self._saved_volume = self.restart_volume / 100.0
             self._restoring_ui = True
             try:
                 self._verify_and_fix_ui_state()
@@ -1792,8 +2065,8 @@ class SpotifyMonitor:
                 # Verify final placement
                 self._verify_and_fix_window_state(new_h)
 
-            # 13. Check if same song loaded — skip immediately if so
-            self.log("[CHECK] Verifying song after restart...")
+            # 13. Verify playback resumed after restart
+            self.log("[CHECK] Verifying playback after restart...")
             for _ in range(5):
                 if self._sleep(1.0):
                     return
@@ -1801,9 +2074,7 @@ class SpotifyMonitor:
                 if new_window:
                     _, new_title = new_window
                     if self.is_song_title(new_title):
-                        if new_title == self.last_song_title:
-                            self.log(f"[SKIP] Same song detected ('{new_title}') — skipping immediately")
-                            self.send_next_key()
+                        self.log(f"[CHECK] Playback active: '{new_title}'")
                         break
 
             # 14. Final focus check
@@ -1856,6 +2127,8 @@ class SpotifyMonitor:
     def stop(self):
         self.running = False
         self.shutdown_event.set()
+        # Persist state to disk on shutdown so it survives app restarts
+        self._save_persisted_state()
         # Ensure Spotify is unmuted when monitor stops.
         # If we were killed mid-restart (_muted=True) the new Spotify instance
         # may not have its audio session registered yet.  Wait briefly so the
@@ -1990,8 +2263,69 @@ def _build_tray(monitor: SpotifyMonitor):
 #  Entry point
 # ==========================================================
 
+def prompt_startup_settings():
+    """Prompt user interactively at startup for session volume and lyrics preferences.
+
+    Returns (volume: int, lyrics_on: bool).
+    """
+    default_vol = getattr(_config, "RESTART_VOLUME", 80)
+    default_lyrics = getattr(_config, "RESTART_LYRICS_ON", True)
+    default_lyrics_str = "y" if default_lyrics else "n"
+
+    print("========================================")
+    print(" Spotify Ad Restarter - Session Setup  ")
+    print("========================================")
+
+    # 1. Volume level prompt
+    vol = default_vol
+    try:
+        raw_vol = input(f"Enter restart volume (0-100) [default: {default_vol}]: ").strip()
+        if raw_vol:
+            try:
+                parsed_vol = int(float(raw_vol))
+                vol = max(0, min(100, parsed_vol))
+            except ValueError:
+                print(f"Invalid volume '{raw_vol}', using default: {default_vol}%")
+                vol = default_vol
+    except (EOFError, KeyboardInterrupt):
+        raise
+
+    # 2. Lyrics state prompt
+    lyrics_on = default_lyrics
+    try:
+        raw_lyrics = input(f"Enable lyrics on restart? (y/n) [default: {default_lyrics_str}]: ").strip().lower()
+        if raw_lyrics:
+            if raw_lyrics in ("y", "yes", "true", "on", "1"):
+                lyrics_on = True
+            elif raw_lyrics in ("n", "no", "false", "off", "0"):
+                lyrics_on = False
+            else:
+                print(f"Invalid input '{raw_lyrics}', using default: {default_lyrics_str}")
+                lyrics_on = default_lyrics
+    except (EOFError, KeyboardInterrupt):
+        raise
+
+    print(f"Session configured: Volume = {vol}% | Lyrics = {'ON' if lyrics_on else 'OFF'}")
+    print("========================================\n")
+    return vol, lyrics_on
+
+
 def main():
-    monitor = SpotifyMonitor()
+    # Prompt user for session volume and lyrics at startup if running interactively
+    restart_vol = getattr(_config, "RESTART_VOLUME", 80)
+    restart_lyrics = getattr(_config, "RESTART_LYRICS_ON", True)
+
+    prompt_enabled = getattr(_config, "PROMPT_STARTUP_SETTINGS", False) or ("--prompt" in sys.argv)
+    if prompt_enabled and sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+        try:
+            restart_vol, restart_lyrics = prompt_startup_settings()
+        except KeyboardInterrupt:
+            print("\nExiting.")
+            sys.exit(0)
+        except EOFError:
+            pass
+
+    monitor = SpotifyMonitor(restart_volume=restart_vol, restart_lyrics=restart_lyrics)
 
     # Run the monitor loop in a daemon thread
     thread = threading.Thread(target=monitor.run, daemon=True)

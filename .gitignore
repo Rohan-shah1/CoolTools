@@ -4,3 +4,8 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .DS_Store
+android/
+ios/
+*.apk
+SpotifyAdSkipper.apk
+.spotify_volume_state.json

@@ -9,10 +9,23 @@ POLL_INTERVAL = 0.25       # Seconds between window title checks (fast sub-secon
 RESTART_DELAY = 0         # Seconds to wait after killing Spotify before relaunch (0 = immediate)
 LOAD_WAIT_TIME = 12       # Max seconds to wait for Spotify window to appear (polls every 0.5s)
 COOLDOWN_PERIOD = 10      # Seconds anti-loop cooldown after a restart (resumes immediately when music plays)
-AMBIGUOUS_AD_DURATION_SECONDS = 8.0  # How long "Spotify Free" must show WITH audio before it's treated as an ad.
-                                     # Song transitions last 1-5s; real Spotify audio ads last 15-60s.
-                                     # 8s is the safe minimum — below this, crossfades can false-trigger.
-                                     # Raise if real ads are missed; lower only if transitions still false-trigger.
+SONG_TRANSITION_GRACE_SECONDS = 12.0 # Seconds after a song ends to ignore transient "Spotify Free" titles during track buffering/crossfade
+AMBIGUOUS_AD_DURATION_SECONDS = 10.0 # How long "Spotify Free" must persist WITH audio AFTER transition grace before it's treated as an ad.
+                                     # Song transitions last 1-8s; real Spotify audio ads last 15-60s.
+
+# --- Volume & UI State on Restart ---------------------------------
+# Fixed volume level (0–100) to set after every ad restart.
+# Spotify always comes back at this volume regardless of what it was before.
+RESTART_VOLUME = 80
+
+# Fixed lyrics state to set after every ad restart (True = ON).
+# Spotify always comes back with lyrics ON regardless of what it was before.
+RESTART_LYRICS_ON = True
+
+# Prompt for volume/lyrics interactively on console startup.
+# Set to False (default) to start immediately and seamlessly without blocking.
+# Set to True if you want an interactive prompt every time you start from a terminal.
+PROMPT_STARTUP_SETTINGS = False
 
 # --- Ad Detection -------------------------------------------------
 # Window titles that indicate an ad is playing.

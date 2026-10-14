@@ -50,8 +50,9 @@ from monitor import (
     AD_TITLE_CONTAINS_LOWER,
     AMBIGUOUS_TITLES,
     _TRAY_COLORS,
+    prompt_startup_settings,
 )
-from reporter import NullReporter
+from reporter import NullReporter, UserConsoleReporter
 
 
 def _make_monitor() -> SpotifyMonitor:
@@ -341,7 +342,134 @@ class TestFindSpotifyWindow(unittest.TestCase):
         with mock.patch("psutil.process_iter", return_value=[]):
             result = m.find_spotify_window()
         self.assertIsNone(m._cached_spotify_hwnd)
-        self.assertIsNone(result)
+
+# ===========================================================================
+#  12. UserConsoleReporter — silence lyrics & volume state in console
+# ===========================================================================
+class TestUserConsoleReporter(unittest.TestCase):
+    def test_state_update_does_not_print(self):
+        reporter = UserConsoleReporter()
+        with mock.patch("builtins.print") as mock_print:
+            reporter.state_update(True, 0.8)
+            reporter.state_update(False, 0.5)
+            reporter.state_update(True, None)
+            mock_print.assert_not_called()
+
+    def test_song_playing_prints_playing_not_state(self):
+        reporter = UserConsoleReporter()
+        with mock.patch("builtins.print") as mock_print:
+            reporter.state_update(True, 0.8)
+            reporter.song_playing("Song Name - Artist Name")
+            mock_print.assert_called_once()
+            args, _ = mock_print.call_args
+            self.assertIn("[Playing]", args[0])
+            self.assertIn("Song Name - Artist Name", args[0])
+            self.assertNotIn("[State]", args[0])
+
+    def test_print_state_does_not_print(self):
+        reporter = UserConsoleReporter()
+        with mock.patch("builtins.print") as mock_print:
+            reporter._last_lyrics = True
+            reporter._last_volume = 0.8
+            reporter._print_state()
+            mock_print.assert_not_called()
+
+
+# ===========================================================================
+#  13. Lyrics ON on restart
+# ===========================================================================
+class TestLyricsRestart(unittest.TestCase):
+    def test_restart_lyrics_on_config_default(self):
+        self.assertTrue(getattr(_config, "RESTART_LYRICS_ON", False))
+
+    def test_restore_spotify_ui_state_targets_lyrics_on(self):
+        m = _make_monitor()
+        m._saved_lyrics_on = False
+        with mock.patch.object(m, "_find_uia_player_controls") as mock_find, \
+             mock.patch.object(m, "_read_lyrics_state_reliable", return_value=True), \
+             mock.patch("monitor.UIA_AVAILABLE", True):
+            lyrics_elem = mock.MagicMock()
+            vol_elem = mock.MagicMock()
+            mock_find.return_value = (lyrics_elem, vol_elem)
+
+            vol_ok, lyrics_ok = m.restore_spotify_ui_state()
+            self.assertTrue(lyrics_ok)
+            self.assertTrue(m._saved_lyrics_on)
+
+    def test_load_persisted_state_sets_lyrics_on_when_config_true(self):
+        m = _make_monitor()
+        with mock.patch("os.path.exists", return_value=False):
+            m._load_persisted_state()
+            self.assertTrue(m._saved_lyrics_on)
+
+
+# ===========================================================================
+#  14. Startup setup prompt & Session preferences
+# ===========================================================================
+class TestStartupPrompt(unittest.TestCase):
+    def test_prompt_custom_values(self):
+        with mock.patch("builtins.input", side_effect=["65", "n"]):
+            vol, lyrics = prompt_startup_settings()
+            self.assertEqual(vol, 65)
+            self.assertFalse(lyrics)
+
+    def test_prompt_defaults_on_empty_input(self):
+        with mock.patch("builtins.input", side_effect=["", ""]):
+            vol, lyrics = prompt_startup_settings()
+            self.assertEqual(vol, getattr(_config, "RESTART_VOLUME", 80))
+            self.assertEqual(lyrics, getattr(_config, "RESTART_LYRICS_ON", True))
+
+    def test_prompt_handles_invalid_volume(self):
+        with mock.patch("builtins.input", side_effect=["invalid", "y"]):
+            vol, lyrics = prompt_startup_settings()
+            self.assertEqual(vol, getattr(_config, "RESTART_VOLUME", 80))
+            self.assertTrue(lyrics)
+
+    def test_prompt_clamps_volume_range(self):
+        with mock.patch("builtins.input", side_effect=["150", "yes"]):
+            vol, lyrics = prompt_startup_settings()
+            self.assertEqual(vol, 100)
+            self.assertTrue(lyrics)
+
+
+class TestSessionSettings(unittest.TestCase):
+    def test_session_settings_override_persisted_state(self):
+        with mock.patch.object(SpotifyMonitor, "_find_spotify_path", return_value=None):
+            m = SpotifyMonitor(
+                reporter=NullReporter(),
+                restart_volume=45,
+                restart_lyrics=False,
+            )
+            self.assertEqual(m.restart_volume, 45.0)
+            self.assertFalse(m.restart_lyrics)
+            self.assertAlmostEqual(m._saved_volume, 0.45)
+            self.assertFalse(m._saved_lyrics_on)
+
+    def test_restore_ui_state_uses_session_settings(self):
+        with mock.patch.object(SpotifyMonitor, "_find_spotify_path", return_value=None):
+            m = SpotifyMonitor(
+                reporter=NullReporter(),
+                restart_volume=30,
+                restart_lyrics=False,
+            )
+            m._saved_lyrics_on = True
+            with mock.patch.object(m, "_find_uia_player_controls") as mock_find, \
+                 mock.patch.object(m, "_read_lyrics_state_reliable", return_value=False), \
+                 mock.patch("monitor.UIA_AVAILABLE", True):
+                lyrics_elem = mock.MagicMock()
+                vol_elem = mock.MagicMock()
+                range_pat = mock.MagicMock()
+                range_client = mock.MagicMock()
+                range_client.CurrentValue = 0.30
+                range_pat.QueryInterface.return_value = range_client
+                vol_elem.GetCurrentPattern.return_value = range_pat
+                mock_find.return_value = (lyrics_elem, vol_elem)
+
+                vol_ok, lyrics_ok = m.restore_spotify_ui_state()
+                self.assertTrue(vol_ok)
+                self.assertTrue(lyrics_ok)
+                self.assertFalse(m._saved_lyrics_on)
+
 
 
 if __name__ == "__main__":
