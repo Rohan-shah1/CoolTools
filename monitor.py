@@ -1580,6 +1580,11 @@ class SpotifyMonitor:
         The --force-renderer-accessibility flag ensures Chromium's renderer
         process builds a complete accessibility tree, which is required for
         reliable Lyrics toggle state detection via UIA.
+
+        Uses STARTUPINFO with SW_HIDE to prevent the new Spotify window from
+        stealing foreground focus or flashing on screen during launch.
+        The window state is managed explicitly later in step 8 of the restart
+        sequence so the user is never interrupted.
         """
         # Re-attempt path detection: if Spotify was not installed in a standard
         # location at startup, try to locate it now from running processes.
@@ -1588,14 +1593,21 @@ class SpotifyMonitor:
             if self.spotify_path:
                 self.log(f"[LAUNCH] Spotify path resolved: {self.spotify_path}")
 
+        # Build STARTUPINFO to suppress the initial foreground-grab.
+        # SW_SHOWMINNOACTIVE tells Windows not to activate the window on creation.
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 7  # SW_SHOWMINNOACTIVE — show minimised, don't activate
+
         if self.spotify_path and os.path.exists(self.spotify_path):
             cmd = [self.spotify_path, _FORCE_A11Y_FLAG]
             subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                startupinfo=si,
             )
-            self.log(f"[LAUNCH] Started: {' '.join(cmd)}")
+            self.log(f"[LAUNCH] Started (minimised, no-activate): {' '.join(cmd)}")
         else:
             # Fallback: use subprocess with the spotify: URI protocol.
             # os.startfile cannot pass command-line flags, so we use
@@ -1606,8 +1618,9 @@ class SpotifyMonitor:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     shell=False,
+                    startupinfo=si,
                 )
-                self.log("[LAUNCH] Started via spotify: protocol (subprocess)")
+                self.log("[LAUNCH] Started via spotify: protocol (minimised, no-activate)")
             except Exception as e:
                 # Last resort fallback
                 self.log(f"[WARN] subprocess protocol launch failed ({e}), trying os.startfile")
@@ -1958,17 +1971,21 @@ class SpotifyMonitor:
                         if saved_cmd == 2:  # MINIMIZED
                             # Chromium doesn't render UI when minimized, so UIA
                             # cannot find lyrics/volume controls.  Temporarily
-                            # show as NORMAL (off-screen-ish, non-active) so the
-                            # renderer populates the accessibility tree, then
-                            # re-minimize after UI state is restored.
-                            self.log("[WINDOW-STATE] Spotify was MINIMIZED — temporarily showing as NORMAL for UIA access")
+                            # show as NORMAL but positioned OFF-SCREEN so the
+                            # renderer populates the accessibility tree without
+                            # any visible flash for the user, then re-minimize
+                            # after UI state is restored.
+                            self.log("[WINDOW-STATE] Spotify was MINIMIZED — temporarily showing NORMAL off-screen for UIA access")
                             try:
                                 p = self._saved_window_placement
-                                temp_pl = (p[0], win32con.SW_SHOWNOACTIVATE, p[2], p[3], p[4])
+                                # Move the window far off-screen (x=-32000) so it is
+                                # technically NORMAL (renderer active) but invisible.
+                                offscreen_rect = (-32000, -32000, -32000 + (p[4][2] - p[4][0]), -32000 + (p[4][3] - p[4][1]))
+                                temp_pl = (p[0], win32con.SW_SHOWNOACTIVATE, p[2], p[3], offscreen_rect)
                                 win32gui.SetWindowPlacement(new_h, temp_pl)
                                 need_reminimize = True
                             except Exception as e:
-                                self.log(f"[WARN] Failed to temp-show Spotify: {e}")
+                                self.log(f"[WARN] Failed to temp-show Spotify off-screen: {e}")
                         else:
                             self.log(f"[WINDOW-STATE] Spotify was background — restoring as {state_names.get(saved_cmd, saved_cmd)} without activation")
                             try:
@@ -2105,6 +2122,11 @@ class SpotifyMonitor:
 
         Spotify grabs the foreground on its own when it launches.  We call this
         after the full restart sequence so the user ends up back where they were.
+
+        Uses thread-input attachment to bypass the Windows foreground-lock
+        restriction that normally prevents background processes from stealing
+        focus.  This is the same technique used by Alt-Tab and task-switching
+        utilities.
         """
         if not hwnd:
             self.log("[FOCUS-GUARD] No previous foreground window to restore")
@@ -2114,13 +2136,39 @@ class SpotifyMonitor:
             if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
                 self.log(f"[FOCUS-GUARD] Previous window {hwnd} no longer valid/visible — skipping focus restore")
                 return
-            # Allow our process to set the foreground window
-            ctypes.windll.user32.AllowSetForegroundWindow(os.getpid())
-            # Give Spotify a moment to finish its own focus grab, then override it
-            if self._sleep(0.3):
+
+            # Wait for Spotify to finish its own focus-grab sequence, then override.
+            if self._sleep(0.5):
                 return
-            win32gui.SetForegroundWindow(hwnd)
-            self.log(f"[FOCUS-GUARD] Returned focus to previous window (HWND={hwnd})")
+
+            user32 = ctypes.windll.user32
+
+            # Attach our thread to the foreground window's thread so we are
+            # allowed to call SetForegroundWindow without Windows blocking it.
+            our_tid = user32.GetCurrentThreadId()
+            fg_hwnd = user32.GetForegroundWindow()
+            fg_tid = 0
+            if fg_hwnd:
+                fg_tid, _ = win32process.GetWindowThreadProcessId(fg_hwnd)
+
+            attached = False
+            if fg_tid and fg_tid != our_tid:
+                attached = bool(user32.AttachThreadInput(our_tid, fg_tid, True))
+
+            try:
+                # Unlock the foreground window lock so SetForegroundWindow works
+                user32.LockSetForegroundWindow(2)  # LSFW_UNLOCK
+                user32.AllowSetForegroundWindow(-1)  # ASFW_ANY — allow any process
+
+                # BringWindowToTop first, then SetForegroundWindow for reliability
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+
+                self.log(f"[FOCUS-GUARD] Returned focus to previous window (HWND={hwnd})")
+            finally:
+                if attached:
+                    user32.AttachThreadInput(our_tid, fg_tid, False)
+
         except Exception as e:
             self.log(f"[WARN] Could not return focus: {e}")
 
